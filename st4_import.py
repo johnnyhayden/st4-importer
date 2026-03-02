@@ -5,8 +5,11 @@ import argparse
 import json
 import os
 import re
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import wave
@@ -15,7 +18,10 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+import lyricsgenius
 
 # ── Bus mapping ──────────────────────────────────────────────────────────────
 
@@ -46,6 +52,31 @@ DEFAULT_EQ = {
     ],
     "bypass": False,
 }
+
+# ── FFmpeg / conversion helpers ──────────────────────────────────────────────
+
+
+def ffmpeg_available():
+    """Return True if ffmpeg is on PATH."""
+    return shutil.which("ffmpeg") is not None
+
+
+def convert_wav_to_mp3(wav_path, bitrate="192k"):
+    """Convert a WAV file to MP3 using ffmpeg. Returns path to a temp MP3 file."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    tmp.close()
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(wav_path),
+            "-codec:a", "libmp3lame", "-b:a", bitrate,
+            tmp.name,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+    return tmp.name
+
 
 # ── WAV helpers ──────────────────────────────────────────────────────────────
 
@@ -182,96 +213,142 @@ def normalize_title(title):
 
 # ── API lookups ──────────────────────────────────────────────────────────────
 
-MUSICBRAINZ_UA = "ST4Importer/1.0 (st4-importer)"
-_last_mb_request = 0.0
+# Preferred artist search order for metadata lookups.
+METADATA_ARTIST_ORDER = [
+    "Fleetwood Mac",
+    "Stevie Nicks",
+    "Tom Petty",
+    "Tom Petty and the Heartbreakers",
+]
+
+# ── Genius lyrics config ─────────────────────────────────────────────────────
+
+GENIUS_ACCESS_TOKEN = "NfWHIqz-VIwU2H9PwMpusGa8yuCL9-Q3ra4nCtqu3MlJvAt8R6c2GOZSu05OxgTB"
+
+LYRICS_ARTIST_ORDER = [
+    "Fleetwood Mac",
+    "Stevie Nicks",
+    "Tom Petty",
+    "Tom Petty and the Heartbreakers",
+]
+
+_genius_client = None
 
 
-def _mb_rate_limit():
-    """Enforce 1 request/sec for MusicBrainz."""
-    global _last_mb_request
-    elapsed = time.time() - _last_mb_request
-    if elapsed < 1.1:
-        time.sleep(1.1 - elapsed)
-    _last_mb_request = time.time()
+def _get_genius():
+    global _genius_client
+    if _genius_client is None:
+        _genius_client = lyricsgenius.Genius(
+            GENIUS_ACCESS_TOKEN, verbose=False,
+            remove_section_headers=True, skip_non_songs=True, retries=2,
+        )
+    return _genius_client
 
 
-def lookup_musicbrainz(title):
-    """Look up artist and canonical title via MusicBrainz recording search."""
-    _mb_rate_limit()
-    query = title.replace(" ", "+")
-    url = f"https://musicbrainz.org/ws/2/recording/?query={query}&fmt=json&limit=5"
-    req = Request(url, headers={"User-Agent": MUSICBRAINZ_UA})
-    try:
+def lookup_itunes(title):
+    """Look up artist and canonical title via iTunes Search API.
+
+    Tries each artist in METADATA_ARTIST_ORDER, returning the first match.
+    Falls back to an unqualified search if no artist-specific match is found.
+    """
+    norm_query = normalize_title(title)
+
+    def _search(term, artist=None):
+        params = quote(f"{artist} {term}" if artist else term)
+        url = f"https://itunes.apple.com/search?term={params}&media=music&entity=song&limit=10"
+        req = Request(url)
         with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        recordings = data.get("recordings", [])
-        if not recordings:
-            return None, None, None
+            return json.loads(resp.read()).get("results", [])
 
-        # Find best match by normalized title
-        norm_query = normalize_title(title)
-        best = recordings[0]
-        for rec in recordings:
-            if normalize_title(rec.get("title", "")) == norm_query:
-                best = rec
-                break
+    def _best_match(results, strict=False):
+        """Return the result whose trackName best matches the query title.
 
-        artist = ""
-        credits = best.get("artist-credit", [])
-        if credits:
-            parts = []
-            for c in credits:
-                parts.append(c.get("name", ""))
-                joinphrase = c.get("joinphrase", "")
-                if joinphrase:
-                    parts.append(joinphrase)
-            artist = "".join(parts)
+        If strict, only return an exact normalized match (used for per-artist
+        searches so we don't grab an unrelated song by the same artist).
+        """
+        for r in results:
+            if normalize_title(r.get("trackName", "")) == norm_query:
+                return r
+        if not strict:
+            return results[0] if results else None
+        return None
 
-        canonical_title = best.get("title", title)
-
-        # Try to get release year
+    def _extract(result):
+        artist = result.get("artistName", "")
+        canonical = result.get("trackName", title)
         year = None
-        releases = best.get("releases", [])
-        if releases:
-            dates = [r.get("date", "") for r in releases if r.get("date")]
-            if dates:
-                dates.sort()
-                year = dates[0][:4] if dates[0] else None
+        release_date = result.get("releaseDate", "")
+        if release_date:
+            year = release_date[:4]
+        return artist, canonical, year
 
-        return artist, canonical_title, year
+    # Try each preferred artist in order (strict: title must match)
+    for artist in METADATA_ARTIST_ORDER:
+        try:
+            results = _search(title, artist)
+            match = _best_match(results, strict=True)
+            if match:
+                return _extract(match)
+        except (URLError, OSError, json.JSONDecodeError, KeyError) as e:
+            print(f"  [iTunes lookup failed for '{artist}': {e}]")
+
+    # Fallback: search with just the title
+    try:
+        results = _search(title)
+        match = _best_match(results)
+        if match:
+            return _extract(match)
     except (URLError, OSError, json.JSONDecodeError, KeyError) as e:
-        print(f"  [MusicBrainz lookup failed: {e}]")
-        return None, None, None
+        print(f"  [iTunes lookup failed: {e}]")
+
+    return None, None, None
+
+
+def _clean_genius_lyrics(lyrics):
+    """Clean Genius formatting artifacts from lyrics text."""
+    if not lyrics:
+        return ""
+    # Remove the title/artist header line Genius prepends (e.g. "Song Title Lyrics")
+    lines = lyrics.split("\n")
+    if lines and lines[0].endswith("Lyrics"):
+        lines = lines[1:]
+    text = "\n".join(lines)
+    # Remove preamble up to and including "Read More" (contributor counts, descriptions)
+    text = re.sub(r"(?si)^.*?Read More\s*", "", text)
+    # Remove trailing "Embed" or "...Embed" text Genius appends
+    text = re.sub(r"\d*Embed$", "", text).rstrip()
+    return text
 
 
 def lookup_lyrics(title, artist=""):
-    """Look up lyrics via LRCLIB API."""
-    params = f"track_name={title.replace(' ', '+')}"
-    if artist:
-        params += f"&artist_name={artist.replace(' ', '+')}"
-    url = f"https://lrclib.net/api/search?{params}"
-    req = Request(url, headers={"User-Agent": MUSICBRAINZ_UA})
+    """Look up lyrics via Genius API, trying preferred artists first."""
+    genius = _get_genius()
+    # Build list of artists to try: preferred order first, then MB-discovered artist
+    artists_to_try = list(LYRICS_ARTIST_ORDER)
+    if artist and artist not in artists_to_try:
+        artists_to_try.append(artist)
+
+    for try_artist in artists_to_try:
+        try:
+            song = genius.search_song(title, try_artist)
+            if song:
+                cleaned = _clean_genius_lyrics(song.lyrics)
+                if cleaned:
+                    return cleaned
+        except Exception as e:
+            print(f"  [Genius lookup failed for '{try_artist}': {e}]")
+
+    # Last resort: search with no artist
     try:
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        if not data:
-            return ""
+        song = genius.search_song(title)
+        if song:
+            cleaned = _clean_genius_lyrics(song.lyrics)
+            if cleaned:
+                return cleaned
+    except Exception as e:
+        print(f"  [Genius lookup failed: {e}]")
 
-        # Prefer synced lyrics, fall back to plain
-        best = data[0]
-        norm_query = normalize_title(title)
-        for entry in data:
-            if normalize_title(entry.get("trackName", "")) == norm_query:
-                best = entry
-                break
-
-        synced = best.get("syncedLyrics", "")
-        if synced:
-            return synced
-        return best.get("plainLyrics", "")
-    except (URLError, OSError, json.JSONDecodeError) as e:
-        print(f"  [Lyrics lookup failed: {e}]")
-        return ""
+    return ""
 
 
 # ── Song/track builders ─────────────────────────────────────────────────────
@@ -376,7 +453,17 @@ def main():
     parser.add_argument(
         "--dry-run", action="store_true", help="Preview without writing"
     )
+    parser.add_argument(
+        "--no-convert", action="store_true",
+        help="Keep original WAV files instead of converting to 192kbps MP3",
+    )
     args = parser.parse_args()
+
+    # Determine whether to convert WAV→MP3
+    do_convert = not args.no_convert
+    if do_convert and not ffmpeg_available():
+        print("Warning: ffmpeg not found on PATH — skipping MP3 conversion (keeping WAV)")
+        do_convert = False
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -450,7 +537,7 @@ def main():
                 print(f"\n  NEW: \"{song_name}\" ({len(stems)} stems)")
                 for num, stem_name, path in stems:
                     bus = STEM_BUS_MAP.get(stem_name, DEFAULT_BUS)
-                    print(f"    {num:02d} {stem_name} → bus {bus}")
+                    print(f"    {num:02d} {stem_name} → bus {bus + 1}")
         print(f"\nDry run complete. Would write to: {output_path}")
         sys.exit(0)
 
@@ -470,10 +557,19 @@ def main():
     filtered_songs = [s for s in existing_songs if s["id"] not in replaced_song_ids]
     filtered_tracks = [t for t in existing_tracks if t["songID"] not in replaced_song_ids]
 
+    # Also filter junction/child tables that reference replaced songs
+    if replaced_song_ids:
+        for key in ("playlistSongs", "songKeywords", "regions"):
+            if key in backup_json:
+                backup_json[key] = [
+                    r for r in backup_json[key] if r.get("songID") not in replaced_song_ids
+                ]
+
     # ── Process each new song ────────────────────────────────────────────
     new_song_entries = []
     new_track_entries = []
     new_wav_files = []  # (zip_path, local_path)
+    temp_mp3_files = []  # temp files to clean up after zip is written
 
     for song_name in sorted(new_songs_to_add.keys()):
         stems = new_songs_to_add[song_name]
@@ -483,8 +579,8 @@ def main():
         print(f"\nProcessing: \"{song_name}\"")
 
         # Look up metadata
-        print("  Looking up artist/title on MusicBrainz...")
-        artist, canonical_title, year = lookup_musicbrainz(song_name)
+        print("  Looking up artist/title on iTunes...")
+        artist, canonical_title, year = lookup_itunes(song_name)
         if artist:
             print(f"  Artist: {artist}")
         else:
@@ -499,7 +595,7 @@ def main():
         # Use canonical title for the directory name
         dir_name = f"{canonical_title}__{dir_prefix_id}"
 
-        print("  Looking up lyrics on LRCLIB...")
+        print("  Looking up lyrics on Genius...")
         lyrics = lookup_lyrics(canonical_title, artist)
         if lyrics:
             print(f"  Lyrics: found ({len(lyrics)} chars)")
@@ -536,8 +632,17 @@ def main():
             max_duration = max(max_duration, dur)
 
             bus = STEM_BUS_MAP.get(stem_name, DEFAULT_BUS)
-            # filePath uses original filename (without apostrophes) inside canonical dir
-            zip_file_path = f"{dir_name}/{path.name}"
+
+            # Convert WAV→MP3 if enabled
+            if do_convert:
+                mp3_name = path.stem + ".mp3"
+                zip_file_path = f"{dir_name}/{mp3_name}"
+                mp3_path = convert_wav_to_mp3(str(path))
+                temp_mp3_files.append(mp3_path)
+                local_file = Path(mp3_path)
+            else:
+                zip_file_path = f"{dir_name}/{path.name}"
+                local_file = path
 
             track = make_track(
                 track_id=track_id,
@@ -549,8 +654,9 @@ def main():
                 name="",
             )
             song_tracks.append(track)
-            song_wavs.append((zip_file_path, path))
-            print(f"  Track {track_number}: {stem_name} → bus {bus} ({dur:.1f}s)")
+            song_wavs.append((zip_file_path, local_file))
+            fmt = "mp3" if do_convert else "wav"
+            print(f"  Track {track_number}: {stem_name} → bus {bus + 1} ({dur:.1f}s) [{fmt}]")
 
         if not song_tracks:
             print(f"  No non-silent tracks — skipping song")
@@ -589,30 +695,38 @@ def main():
 
     updated_json = json.dumps(backup_json, sort_keys=True, indent=2, ensure_ascii=False)
 
-    with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_STORED) as zout:
+    with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zout:
         # Copy existing entries (except backup_data.json and replaced dirs)
         with zipfile.ZipFile(str(input_path), "r") as zin:
-            for item in zin.namelist():
-                if item == "backup_data.json":
+            for item in zin.infolist():
+                if item.filename == "backup_data.json":
                     continue
                 # Skip entries from replaced songs
                 skip = False
                 for prefix in replaced_dir_prefixes:
-                    if item.startswith(prefix + "/") or item == prefix:
+                    if item.filename.startswith(prefix + "/") or item.filename == prefix:
                         skip = True
                         break
                 if skip:
                     continue
-                data = zin.read(item)
+                # Preserve original entry metadata by copying ZipInfo
+                data = zin.read(item.filename)
                 zout.writestr(item, data)
 
-        # Write new WAV files
+        # Write new audio files
         for zip_path, local_path in new_wav_files:
             print(f"  Adding: {zip_path}")
             zout.write(str(local_path), zip_path)
 
         # Write updated backup_data.json
         zout.writestr("backup_data.json", updated_json)
+
+    # Clean up temp MP3 files
+    for tmp in temp_mp3_files:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
     print(f"\nDone! Added {len(new_song_entries)} song(s) with {len(new_track_entries)} track(s).")
     print(f"Output: {output_path}")
