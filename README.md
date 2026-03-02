@@ -1,4 +1,4 @@
-# StageTraxx4 Stem Importer
+# Stage Traxx 4 Stem Importer
 
 A Python command-line tool that imports WAV stem files into a StageTraxx4 backup (`.st4b`) file. It parses structured stem filenames, auto-detects metadata from iTunes and lyrics from Genius, detects BPM from click tracks, skips silent stems, and optionally converts WAV to MP3 — producing a ready-to-restore `.st4b` backup.
 
