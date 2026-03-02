@@ -1,0 +1,19 @@
+# StageTraxx4 backup files
+*.st4b
+*.zip
+
+# Stems directory (large WAV files)
+Stems/
+
+# Extracted backup directory
+StageTraxx4_Full_*/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code
+.claude/
