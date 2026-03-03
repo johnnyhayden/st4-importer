@@ -32,6 +32,7 @@ A Python command-line tool for building StageTraxx4 backup (`.st4b`) files. It s
    - Takes **BPM** directly from the CSV `Tempo` column.
    - Converts **duration** from milliseconds to seconds.
    - Calculates **scroll speed** from lyrics density (characters per second of song duration).
+   - Enables the **StageTraxx 4 metronome** (`metronomeMode: 2`, `metronomeType: 1`) so that playing the song produces an audible click at the detected BPM — useful since CSV-imported songs have no audio tracks of their own.
 4. **Skips duplicates** automatically (non-interactive) by comparing normalized titles against existing songs.
 5. **Writes a new `.st4b` file** with the song entries merged into the existing backup.
 
