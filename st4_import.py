@@ -122,10 +122,32 @@ def align_lyrics_to_audio(lyrics_text, audio_wav_path):
                 return None
 
             # Build timestamp map: original line index -> timestamp
+            # Each line gets the end time of the PREVIOUS fragment so it
+            # highlights the instant the previous line finishes being sung,
+            # rather than waiting for the current line's vocals to begin.
             timestamp_map = {}
-            for idx, frag in zip(non_blank_indices, fragments):
-                begin = float(frag.get("begin", 0))
-                timestamp_map[idx] = begin
+            for i, (idx, frag) in enumerate(zip(non_blank_indices, fragments)):
+                if i == 0:
+                    # First line: show at time 0 so the singer is ready
+                    timestamp_map[idx] = 0.0
+                else:
+                    # Use the end time of the previous fragment's actual vocal,
+                    # not the begin time of this fragment (which may be later
+                    # if there's an instrumental gap between lines).
+                    prev_frag = fragments[i - 1]
+                    prev_begin = float(prev_frag.get("begin", 0))
+                    prev_end = float(prev_frag.get("end", 0))
+                    # If there's a gap between prev_end and current begin,
+                    # the line should appear at prev_end (when singing stops).
+                    # If fragments are perfectly contiguous, shift back slightly
+                    # so the line appears just before the vocal starts.
+                    current_begin = float(frag.get("begin", 0))
+                    if current_begin - prev_end < 0.1:
+                        # Contiguous — nudge back so line shows before vocal
+                        timestamp_map[idx] = max(0, prev_end - 1.0)
+                    else:
+                        # Gap exists — show line right when previous ends
+                        timestamp_map[idx] = prev_end
 
             # Reconstruct full lyrics with timestamps on text lines, blank lines preserved
             result_lines = []
