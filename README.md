@@ -10,7 +10,7 @@ A Python command-line tool for building StageTraxx4 backup (`.st4b`) files. It s
 ### Stem Import (default)
 
 1. **Reads an existing `.st4b` backup** (a ZIP archive containing `backup_data.json` and audio files).
-2. **Scans a directory of WAV stems** named in the format `SongName_XX_StemName.wav` (e.g., `Dreams_01_Click.wav`, `Dreams_02_Drums.wav`).
+2. **Scans a directory of WAV stems** named in the format `SongName_Artist_XX_StemName.wav` (e.g., `Dreams_FleetwoodMac_01_Click.wav`). The legacy 3-part format `SongName_XX_StemName.wav` is also accepted — if an artist name is entered at the prompt, files are renamed to the 4-part format automatically.
 3. **Groups stems by song name**, then for each song:
    - Looks up the **artist and canonical title** via the iTunes Search API.
    - Fetches **lyrics** from the Genius API.
@@ -35,9 +35,33 @@ A Python command-line tool for building StageTraxx4 backup (`.st4b`) files. It s
 4. **Skips duplicates** automatically (non-interactive) by comparing normalized titles against existing songs.
 5. **Writes a new `.st4b` file** with the song entries merged into the existing backup.
 
+## Stem Filename Format
+
+Stem files must follow one of two naming conventions:
+
+| Format | Example | Notes |
+|---|---|---|
+| `SongName_Artist_XX_StemName.wav` | `Dreams_FleetwoodMac_01_Click.wav` | **Preferred** — artist is read directly from the filename |
+| `SongName_XX_StemName.wav` | `Dreams_01_Click.wav` | Legacy — artist will be prompted at import time |
+
+- `SongName` — the song title; underscores are treated as spaces internally
+- `Artist` — the artist name with spaces replaced by underscores (e.g. `Tom_Petty`)
+- `XX` — zero-padded track number (e.g. `01`, `02`)
+- `StemName` — one of the recognized stem names (see below)
+
+### Automatic filename upgrade
+
+When a stem file uses the legacy 3-part format and you provide an artist name at the import prompt, the tool **immediately renames all stem files for that song** on disk to the 4-part format. For example:
+
+```
+Dreams_01_Click.wav  →  Dreams_Fleetwood_Mac_01_Click.wav
+Dreams_02_Drums.wav  →  Dreams_Fleetwood_Mac_02_Drums.wav
+```
+
+This means future imports of the same stems will not prompt for the artist again.
+
 ## Assumptions
 
-- **Stem filename format**: Files must follow the pattern `SongName_XX_StemName.wav` where `XX` is a two-digit track number and `StemName` matches one of the recognized bus names. Underscores in the song name separate the components.
 - **Recognized stem names**: `Click`, `Drums`, `Percussion`, `Bass`, `Guitar`, `Electric_Rhythm`, `Electric_Lead`, `Keys`, `Pad`, `Vocals_BG`, `Vocals_Lead`, `Cues`. Unrecognized names are assigned to the Percussion bus by default.
 - **Artist search order**: iTunes and Genius lookups prioritize Fleetwood Mac, Stevie Nicks, Tom Petty, and Tom Petty and the Heartbreakers. This is hardcoded for the current use case and can be edited in the `METADATA_ARTIST_ORDER` and `LYRICS_ARTIST_ORDER` lists.
 - **Input backup structure**: The `.st4b` file is expected to be a ZIP archive with a `backup_data.json` at its root, conforming to the StageTraxx4 schema.

@@ -304,13 +304,20 @@ def detect_bpm(path):
 
 
 def parse_stem_filename(filename):
-    """Parse 'SongName_XX_StemName.wav' → (song_name, track_num, stem_name)."""
+    """Parse stem filename → (song_name, artist_hint, track_num, stem_name).
+
+    Supports two formats:
+      4-part (new): SongName_Artist_XX_StemName.wav
+      3-part (old): SongName_XX_StemName.wav  → artist_hint=""
+    """
     base = filename.rsplit(".", 1)[0]  # strip .wav
-    # Match: everything up to _XX_ where XX is digits, then stem name
-    m = re.match(r"^(.+?)_(\d+)_(.+)$", base)
-    if not m:
-        return None
-    return m.group(1), int(m.group(2)), m.group(3)
+    m4 = re.match(r"^(.+?)_(.+?)_(\d+)_(.+)$", base)
+    if m4:
+        return m4.group(1), m4.group(2), int(m4.group(3)), m4.group(4)
+    m3 = re.match(r"^(.+?)_(\d+)_(.+)$", base)
+    if m3:
+        return m3.group(1), "", int(m3.group(2)), m3.group(3)
+    return None
 
 
 def normalize_title(title):
@@ -662,8 +669,28 @@ def find_stems_dir():
     return None
 
 
+def rename_stems_with_artist(stems, artist_name):
+    """Rename 3-part stem files (SongName_XX_Stem.wav) to 4-part by inserting artist name.
+
+    Returns an updated stems list with new file paths.
+    """
+    artist_for_filename = artist_name.replace(" ", "_")
+    updated = []
+    for num, stem_name, path, _ in stems:
+        m = re.match(r"^(.+?)_(\d+)_(.+)$", path.stem)
+        if m:
+            new_name = f"{m.group(1)}_{artist_for_filename}_{m.group(2)}_{m.group(3)}{path.suffix}"
+            new_path = path.parent / new_name
+            path.rename(new_path)
+            print(f"  Renamed: {path.name} → {new_name}")
+            updated.append((num, stem_name, new_path, artist_name))
+        else:
+            updated.append((num, stem_name, path, artist_name))
+    return updated
+
+
 def group_stems(stems_dir):
-    """Group stem files by song name. Returns {song_name: [(num, stem_name, path), ...]}."""
+    """Group stem files by song name. Returns {song_name: [(num, stem_name, path, artist_hint), ...]}."""
     songs = defaultdict(list)
     for f in sorted(stems_dir.iterdir()):
         if not f.name.lower().endswith(".wav"):
@@ -672,8 +699,8 @@ def group_stems(stems_dir):
         if parsed is None:
             print(f"  Warning: Could not parse filename: {f.name}")
             continue
-        song_name, track_num, stem_name = parsed
-        songs[song_name].append((track_num, stem_name, f))
+        song_name, artist_hint, track_num, stem_name = parsed
+        songs[song_name].append((track_num, stem_name, f, artist_hint))
     # Sort each song's stems by track number
     for name in songs:
         songs[name].sort(key=lambda x: x[0])
@@ -833,7 +860,7 @@ def main():
             if norm not in existing_norm_titles:
                 stems = stem_groups[song_name]
                 print(f"\n  NEW: \"{song_name}\" ({len(stems)} stems)")
-                for num, stem_name, path in stems:
+                for num, stem_name, path, artist_hint in stems:
                     bus = STEM_BUS_MAP.get(stem_name, DEFAULT_BUS)
                     print(f"    {num:02d} {stem_name} → bus {bus + 1}")
         print(f"\nDry run complete. Would write to: {output_path}")
@@ -876,9 +903,20 @@ def main():
 
         print(f"\nProcessing: \"{song_name}\"")
 
+        # Resolve artist hint from filename (all stems share the same artist)
+        _, _, _, artist_hint = stems[0]
+        if artist_hint:
+            artist_hint_clean = artist_hint.replace("_", " ")
+        else:
+            print("  Artist not found in filename.")
+            raw = input("  Enter artist name (or press Enter to search automatically): ").strip()
+            artist_hint_clean = raw  # empty string → fallback to METADATA_ARTIST_ORDER loop
+            if raw:
+                stems = rename_stems_with_artist(stems, raw)
+
         # Look up metadata
         print("  Looking up artist/title on iTunes...")
-        artist, canonical_title, year = lookup_itunes(song_name)
+        artist, canonical_title, year = lookup_itunes(song_name, artist=artist_hint_clean or None)
         if artist:
             print(f"  Artist: {artist}")
         else:
@@ -931,7 +969,7 @@ def main():
         song_tracks = []
         song_wavs = []
 
-        for num, stem_name, path in stems:
+        for num, stem_name, path, _ in stems:
             # Check if silent
             if wav_is_silent(str(path)):
                 print(f"  Skipping silent track: {path.name}")
