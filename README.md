@@ -7,7 +7,7 @@ A Python command-line tool for building StageTraxx4 backup (`.st4b`) files. It s
 
 ## What It Does
 
-### Stem Import (default)
+### Stem Import (`--stems`)
 
 1. **Reads an existing `.st4b` backup** (a ZIP archive containing `backup_data.json` and audio files).
 2. **Scans a directory of WAV stems** named in the format `SongName_Artist_XX_StemName.wav` (e.g., `Dreams_FleetwoodMac_01_Click.wav`). The legacy 3-part format `SongName_XX_StemName.wav` is also accepted — if an artist name is entered at the prompt, files are renamed to the 4-part format automatically.
@@ -118,12 +118,14 @@ python st4_import.py <input.st4b> [options]
 
 | Flag | Description |
 |---|---|
-| `--csv <file>` | Path to a Spotify-export CSV for bulk song import. Mutually exclusive with `--stems`. |
-| `--stems <dir>` | Path to the stems directory. Defaults to `./Stems`. Mutually exclusive with `--csv`. |
+| `--stems <dir>` | Path to the stems directory. Required for stem import. |
+| `--csv <file>` | Path to a Spotify-export CSV for bulk song import. |
 | `-o, --output <file>` | Output `.st4b` file path. Defaults to `<input>_imported.st4b`. |
 | `--dry-run` | Preview what would be imported without writing any files. (Stems mode only.) |
 | `--no-convert` | Keep original WAV files instead of converting to MP3. (Stems mode only.) |
 | `--no-align` | Skip forced alignment of lyrics to lead vocal. (Stems mode only.) |
+
+At least one of `--stems` or `--csv` must be provided. Both can be combined in a single run to import stems and CSV songs into the same output file.
 
 ### Generating a Spotify CSV
 
@@ -131,10 +133,10 @@ The `--csv` mode expects a CSV exported from Spotify. Use [Exportify](https://ex
 
 ### Examples
 
-Import stems from the default `./Stems` directory:
+Import stems:
 
 ```bash
-python st4_import.py MyBackup.st4b
+python st4_import.py MyBackup.st4b --stems ./Stems
 ```
 
 Bulk import songs from a Spotify-export CSV:
@@ -143,26 +145,26 @@ Bulk import songs from a Spotify-export CSV:
 python st4_import.py MyBackup.st4b --csv songs.csv
 ```
 
+Import both stems and CSV songs in one pass:
+
+```bash
+python st4_import.py MyBackup.st4b --stems ./Stems --csv songs.csv
+```
+
 Specify a custom output file:
 
 ```bash
-python st4_import.py MyBackup.st4b --csv songs.csv -o NewBackup.st4b
+python st4_import.py MyBackup.st4b --stems ./Stems -o NewBackup.st4b
 ```
 
 Dry run to preview stem import without modifying anything:
 
 ```bash
-python st4_import.py MyBackup.st4b --dry-run
-```
-
-Specify a custom stems directory and output file:
-
-```bash
-python st4_import.py MyBackup.st4b --stems /path/to/stems -o NewBackup.st4b
+python st4_import.py MyBackup.st4b --stems ./Stems --dry-run
 ```
 
 Keep WAV files without converting to MP3:
 
 ```bash
-python st4_import.py MyBackup.st4b --no-convert
+python st4_import.py MyBackup.st4b --stems ./Stems --no-convert
 ```

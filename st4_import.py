@@ -491,13 +491,14 @@ def lookup_lyrics(title, artist=""):
 # ── Song/track builders ─────────────────────────────────────────────────────
 
 
-def make_song(song_id, title, artist, duration, bpm, lyrics):
+def make_song(song_id, title, artist, duration, bpm, lyrics, year=None):
     """Build a song dict matching StageTraxx4 schema."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "added": now,
         "artist": artist,
         "bpm": bpm,
+        "year": int(year) if year else 0,
         "chordTranspose": 0,
         "color": 0,
         "duration": duration,
@@ -645,8 +646,11 @@ def bulk_import_csv(csv_path, backup_json):
             duration=duration_seconds,
             bpm=bpm,
             lyrics=lyrics,
+            year=year,
         )
         song_entry["scrollSpeed"] = scroll_speed
+        song_entry["metronomeMode"] = 2  # enable metronome for stem-less CSV songs
+        song_entry["metronomeType"] = 1
         print(f"    BPM: {bpm}, Duration: {duration_seconds:.1f}s, Scroll: {scroll_speed}")
 
         backup_json.setdefault("songs", []).append(song_entry)
@@ -660,26 +664,16 @@ def bulk_import_csv(csv_path, backup_json):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
-def find_stems_dir():
-    """Find stems directory (case-insensitive)."""
-    for name in ["Stems", "stems", "STEMS"]:
-        p = Path(name)
-        if p.is_dir():
-            return p
-    return None
-
-
 def rename_stems_with_artist(stems, artist_name):
     """Rename 3-part stem files (SongName_XX_Stem.wav) to 4-part by inserting artist name.
 
     Returns an updated stems list with new file paths.
     """
-    artist_for_filename = artist_name.replace(" ", "_")
     updated = []
     for num, stem_name, path, _ in stems:
         m = re.match(r"^(.+?)_(\d+)_(.+)$", path.stem)
         if m:
-            new_name = f"{m.group(1)}_{artist_for_filename}_{m.group(2)}_{m.group(3)}{path.suffix}"
+            new_name = f"{m.group(1)}_{artist_name}_{m.group(2)}_{m.group(3)}{path.suffix}"
             new_path = path.parent / new_name
             path.rename(new_path)
             print(f"  Renamed: {path.name} → {new_name}")
@@ -717,7 +711,7 @@ def main():
         help="CSV file for bulk song import (mutually exclusive with --stems)",
     )
     parser.add_argument(
-        "--stems", type=Path, default=None, help="Stems directory (default: ./Stems)"
+        "--stems", type=Path, default=None, help="Stems directory (required for stem import)"
     )
     parser.add_argument(
         "-o", "--output", default=None, help="Output .st4b file (default: <input>_imported.st4b)"
@@ -735,8 +729,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.csv and args.stems:
-        print("Error: --csv and --stems are mutually exclusive.")
+    if not args.csv and not args.stems:
+        print("Error: provide --stems <dir>, --csv <file>, or both.")
         sys.exit(1)
 
     input_path = Path(args.input)
@@ -751,306 +745,269 @@ def main():
             input_path.stem + "_imported" + input_path.suffix
         )
 
-    # ── CSV bulk import mode ────────────────────────────────────────────
-    if args.csv:
-        if not args.csv.exists():
-            print(f"Error: CSV file not found: {args.csv}")
-            sys.exit(1)
-
-        print(f"Reading backup: {input_path}")
-        with zipfile.ZipFile(str(input_path), "r") as zin:
-            backup_json = json.loads(zin.read("backup_data.json"))
-
-        added = bulk_import_csv(str(args.csv), backup_json)
-
-        if added == 0:
-            print("No new songs to add.")
-            sys.exit(0)
-
-        # Update metadata timestamp
-        backup_json["metadata"]["created"] = datetime.now(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-
-        updated_json = json.dumps(backup_json, sort_keys=True, indent=2, ensure_ascii=False)
-
-        print(f"\nWriting output: {output_path}")
-        with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zout:
-            # Copy existing entries except backup_data.json
-            with zipfile.ZipFile(str(input_path), "r") as zin:
-                for item in zin.infolist():
-                    if item.filename == "backup_data.json":
-                        continue
-                    data = zin.read(item.filename)
-                    zout.writestr(item, data)
-            # Write updated backup_data.json
-            zout.writestr("backup_data.json", updated_json)
-
-        print(f"\nDone! Added {added} song(s).")
-        print(f"Output: {output_path}")
-        return
-
-    # ── Stems import mode ───────────────────────────────────────────────
-    # Determine whether to convert WAV→MP3
-    do_convert = not args.no_convert
-    if do_convert and not ffmpeg_available():
-        print("Warning: ffmpeg not found on PATH — skipping MP3 conversion (keeping WAV)")
-        do_convert = False
-
-    do_align = not args.no_align
-    if do_align and not aeneas_available():
-        print("Warning: aeneas/espeak not found — skipping lyric alignment")
-        do_align = False
-
-    stems_dir = args.stems or find_stems_dir()
-    if stems_dir is None or not stems_dir.is_dir():
-        print(f"Error: Stems directory not found. Use --stems to specify.")
-        sys.exit(1)
-
     # ── Read existing backup ─────────────────────────────────────────────
     print(f"Reading backup: {input_path}")
     with zipfile.ZipFile(str(input_path), "r") as zin:
         backup_json = json.loads(zin.read("backup_data.json"))
 
-    existing_songs = backup_json.get("songs", [])
-    existing_tracks = backup_json.get("tracks", [])
-    existing_norm_titles = {normalize_title(s["title"]): s for s in existing_songs}
+    csv_added = 0
 
-    # ── Scan stems ───────────────────────────────────────────────────────
-    print(f"Scanning stems: {stems_dir}")
-    stem_groups = group_stems(stems_dir)
-    print(f"Found {len(stem_groups)} song(s): {', '.join(sorted(stem_groups.keys()))}\n")
+    # ── CSV bulk import ──────────────────────────────────────────────────
+    if args.csv:
+        if not args.csv.exists():
+            print(f"Error: CSV file not found: {args.csv}")
+            sys.exit(1)
+        csv_added = bulk_import_csv(str(args.csv), backup_json)
 
-    # ── Detect duplicates ────────────────────────────────────────────────
-    new_songs_to_add = {}  # song_name -> stems list
-    songs_to_replace = {}  # song_name -> existing song dict
-
-    for song_name in sorted(stem_groups.keys()):
-        norm = normalize_title(song_name)
-        if norm in existing_norm_titles:
-            existing = existing_norm_titles[norm]
-            if args.dry_run:
-                print(f"  DUPLICATE: \"{song_name}\" matches existing \"{existing['title']}\" — would prompt")
-                continue
-
-            print(f"  DUPLICATE: \"{song_name}\" matches existing \"{existing['title']}\"")
-            while True:
-                choice = input(f"    [s]kip or [r]eplace? ").strip().lower()
-                if choice in ("s", "skip"):
-                    print(f"    Skipping \"{song_name}\"")
-                    break
-                elif choice in ("r", "replace"):
-                    print(f"    Will replace \"{existing['title']}\"")
-                    songs_to_replace[song_name] = existing
-                    new_songs_to_add[song_name] = stem_groups[song_name]
-                    break
-                else:
-                    print("    Please enter 's' or 'r'")
-        else:
-            new_songs_to_add[song_name] = stem_groups[song_name]
-
-    if not new_songs_to_add:
-        print("\nNo new songs to import.")
-        sys.exit(0)
-
-    if args.dry_run:
-        # Show what would be new
-        for song_name in sorted(stem_groups.keys()):
-            norm = normalize_title(song_name)
-            if norm not in existing_norm_titles:
-                stems = stem_groups[song_name]
-                print(f"\n  NEW: \"{song_name}\" ({len(stems)} stems)")
-                for num, stem_name, path, artist_hint in stems:
-                    bus = STEM_BUS_MAP.get(stem_name, DEFAULT_BUS)
-                    print(f"    {num:02d} {stem_name} → bus {bus + 1}")
-        print(f"\nDry run complete. Would write to: {output_path}")
-        sys.exit(0)
-
-    # ── Remove replaced songs/tracks ─────────────────────────────────────
-    replaced_song_ids = set()
-    replaced_dir_prefixes = set()
-    for song_name, existing_song in songs_to_replace.items():
-        sid = existing_song["id"]
-        replaced_song_ids.add(sid)
-        # Find the directory prefix used in existing tracks
-        for t in existing_tracks:
-            if t["songID"] == sid:
-                dir_prefix = t["filePath"].split("/")[0]
-                replaced_dir_prefixes.add(dir_prefix)
-                break
-
-    filtered_songs = [s for s in existing_songs if s["id"] not in replaced_song_ids]
-    filtered_tracks = [t for t in existing_tracks if t["songID"] not in replaced_song_ids]
-
-    # Also filter junction/child tables that reference replaced songs
-    if replaced_song_ids:
-        for key in ("playlistSongs", "songKeywords", "regions"):
-            if key in backup_json:
-                backup_json[key] = [
-                    r for r in backup_json[key] if r.get("songID") not in replaced_song_ids
-                ]
-
-    # ── Process each new song ────────────────────────────────────────────
+    # ── Stems import ─────────────────────────────────────────────────────
     new_song_entries = []
     new_track_entries = []
     new_wav_files = []  # (zip_path, local_path)
     temp_mp3_files = []  # temp files to clean up after zip is written
+    filtered_songs = None  # set below if stems ran
+    filtered_tracks = None
+    replaced_dir_prefixes = set()
 
-    for song_name in sorted(new_songs_to_add.keys()):
-        stems = new_songs_to_add[song_name]
-        song_id = str(uuid.uuid4()).upper()
-        dir_prefix_id = song_id[:6].lower()
+    if args.stems:
+        stems_dir = args.stems
+        if not stems_dir.is_dir():
+            print(f"Error: Stems directory not found: {stems_dir}")
+            sys.exit(1)
 
-        print(f"\nProcessing: \"{song_name}\"")
+        do_convert = not args.no_convert
+        if do_convert and not ffmpeg_available():
+            print("Warning: ffmpeg not found on PATH — skipping MP3 conversion (keeping WAV)")
+            do_convert = False
 
-        # Resolve artist hint from filename (all stems share the same artist)
-        _, _, _, artist_hint = stems[0]
-        if artist_hint:
-            artist_hint_clean = artist_hint.replace("_", " ")
-        else:
-            print("  Artist not found in filename.")
-            raw = input("  Enter artist name (or press Enter to search automatically): ").strip()
-            artist_hint_clean = raw  # empty string → fallback to METADATA_ARTIST_ORDER loop
-            if raw:
-                stems = rename_stems_with_artist(stems, raw)
+        do_align = not args.no_align
+        if do_align and not aeneas_available():
+            print("Warning: aeneas/espeak not found — skipping lyric alignment")
+            do_align = False
 
-        # Look up metadata
-        print("  Looking up artist/title on iTunes...")
-        artist, canonical_title, year = lookup_itunes(song_name, artist=artist_hint_clean or None)
-        if artist:
-            print(f"  Artist: {artist}")
-        else:
-            artist = ""
-            print("  Artist: (not found)")
+        existing_songs = backup_json.get("songs", [])
+        existing_tracks = backup_json.get("tracks", [])
+        existing_norm_titles = {normalize_title(s["title"]): s for s in existing_songs}
 
-        if canonical_title and canonical_title != song_name:
-            print(f"  Canonical title: {canonical_title}")
-        else:
-            canonical_title = song_name
+        # ── Scan stems ───────────────────────────────────────────────────
+        print(f"Scanning stems: {stems_dir}")
+        stem_groups = group_stems(stems_dir)
+        print(f"Found {len(stem_groups)} song(s): {', '.join(sorted(stem_groups.keys()))}\n")
 
-        # Use canonical title for the directory name
-        dir_name = f"{canonical_title}__{dir_prefix_id}"
+        # ── Detect duplicates ────────────────────────────────────────────
+        new_songs_to_add = {}  # song_name -> stems list
+        songs_to_replace = {}  # song_name -> existing song dict
 
-        print("  Looking up lyrics on Genius...")
-        lyrics = lookup_lyrics(canonical_title, artist)
-        if lyrics:
-            print(f"  Lyrics: found ({len(lyrics)} chars)")
-        else:
-            print("  Lyrics: (not found)")
+        for song_name in sorted(stem_groups.keys()):
+            norm = normalize_title(song_name)
+            if norm in existing_norm_titles:
+                existing = existing_norm_titles[norm]
+                if args.dry_run:
+                    print(f"  DUPLICATE: \"{song_name}\" matches existing \"{existing['title']}\" — would prompt")
+                    continue
 
-        # Align lyrics to lead vocal
-        if lyrics and do_align:
-            lead_vocal_stems = [s for s in stems if s[1] == "Vocals_Lead"]
-            if lead_vocal_stems:
-                vocal_wav_path = lead_vocal_stems[0][2]
-                print("  Aligning lyrics to lead vocal...")
-                lrc_lyrics = align_lyrics_to_audio(lyrics, str(vocal_wav_path))
-                if lrc_lyrics:
-                    lyrics = lrc_lyrics
-                    print(f"  Lyrics aligned ({lyrics.count(chr(10)) + 1} lines)")
-                else:
-                    print("  Alignment failed, using plain text")
-
-        # Detect BPM from click track
-        bpm = 0
-        click_stems = [s for s in stems if s[1] == "Click"]
-        if click_stems:
-            click_path = click_stems[0][2]
-            print(f"  Detecting BPM from click track...")
-            bpm = detect_bpm(str(click_path))
-            if bpm:
-                print(f"  BPM: {bpm}")
+                print(f"  DUPLICATE: \"{song_name}\" matches existing \"{existing['title']}\"")
+                while True:
+                    choice = input(f"    [s]kip or [r]eplace? ").strip().lower()
+                    if choice in ("s", "skip"):
+                        print(f"    Skipping \"{song_name}\"")
+                        break
+                    elif choice in ("r", "replace"):
+                        print(f"    Will replace \"{existing['title']}\"")
+                        songs_to_replace[song_name] = existing
+                        new_songs_to_add[song_name] = stem_groups[song_name]
+                        break
+                    else:
+                        print("    Please enter 's' or 'r'")
             else:
-                print("  BPM: (detection failed)")
+                new_songs_to_add[song_name] = stem_groups[song_name]
 
-        # Process individual stems
-        max_duration = 0.0
-        track_number = 0
-        song_tracks = []
-        song_wavs = []
+        if args.dry_run:
+            for song_name in sorted(stem_groups.keys()):
+                norm = normalize_title(song_name)
+                if norm not in existing_norm_titles:
+                    stems = stem_groups[song_name]
+                    print(f"\n  NEW: \"{song_name}\" ({len(stems)} stems)")
+                    for num, stem_name, path, artist_hint in stems:
+                        bus = STEM_BUS_MAP.get(stem_name, DEFAULT_BUS)
+                        print(f"    {num:02d} {stem_name} → bus {bus + 1}")
+            print(f"\nDry run complete. Would write to: {output_path}")
+            sys.exit(0)
 
-        for num, stem_name, path, _ in stems:
-            # Check if silent
-            if wav_is_silent(str(path)):
-                print(f"  Skipping silent track: {path.name}")
+        # ── Remove replaced songs/tracks ─────────────────────────────────
+        replaced_song_ids = set()
+        for song_name, existing_song in songs_to_replace.items():
+            sid = existing_song["id"]
+            replaced_song_ids.add(sid)
+            for t in existing_tracks:
+                if t["songID"] == sid:
+                    dir_prefix = t["filePath"].split("/")[0]
+                    replaced_dir_prefixes.add(dir_prefix)
+                    break
+
+        filtered_songs = [s for s in existing_songs if s["id"] not in replaced_song_ids]
+        filtered_tracks = [t for t in existing_tracks if t["songID"] not in replaced_song_ids]
+
+        if replaced_song_ids:
+            for key in ("playlistSongs", "songKeywords", "regions"):
+                if key in backup_json:
+                    backup_json[key] = [
+                        r for r in backup_json[key] if r.get("songID") not in replaced_song_ids
+                    ]
+
+        # ── Process each new song ────────────────────────────────────────
+        for song_name in sorted(new_songs_to_add.keys()):
+            stems = new_songs_to_add[song_name]
+            song_id = str(uuid.uuid4()).upper()
+            dir_prefix_id = song_id[:6].lower()
+
+            print(f"\nProcessing: \"{song_name}\"")
+
+            # Resolve artist hint from filename (all stems share the same artist)
+            _, _, _, artist_hint = stems[0]
+            if artist_hint:
+                artist_hint_clean = artist_hint.replace("_", " ")
+            else:
+                print("  Artist not found in filename.")
+                raw = input("  Enter artist name (or press Enter to search automatically): ").strip()
+                artist_hint_clean = raw  # empty string → fallback to METADATA_ARTIST_ORDER loop
+                if raw:
+                    stems = rename_stems_with_artist(stems, raw)
+
+            # Look up metadata
+            print("  Looking up artist/title on iTunes...")
+            artist, canonical_title, year = lookup_itunes(song_name, artist=artist_hint_clean or None)
+            if artist:
+                print(f"  Artist: {artist}")
+            else:
+                artist = ""
+                print("  Artist: (not found)")
+
+            if canonical_title and canonical_title != song_name:
+                print(f"  Canonical title: {canonical_title}")
+            else:
+                canonical_title = song_name
+
+            # Use canonical title for the directory name
+            dir_name = f"{canonical_title}__{dir_prefix_id}"
+
+            print("  Looking up lyrics on Genius...")
+            lyrics = lookup_lyrics(canonical_title, artist)
+            if lyrics:
+                print(f"  Lyrics: found ({len(lyrics)} chars)")
+            else:
+                print("  Lyrics: (not found)")
+
+            # Align lyrics to lead vocal
+            if lyrics and do_align:
+                lead_vocal_stems = [s for s in stems if s[1] == "Vocals_Lead"]
+                if lead_vocal_stems:
+                    vocal_wav_path = lead_vocal_stems[0][2]
+                    print("  Aligning lyrics to lead vocal...")
+                    lrc_lyrics = align_lyrics_to_audio(lyrics, str(vocal_wav_path))
+                    if lrc_lyrics:
+                        lyrics = lrc_lyrics
+                        print(f"  Lyrics aligned ({lyrics.count(chr(10)) + 1} lines)")
+                    else:
+                        print("  Alignment failed, using plain text")
+
+            # Detect BPM from click track
+            bpm = 0
+            click_stems = [s for s in stems if s[1] == "Click"]
+            if click_stems:
+                click_path = click_stems[0][2]
+                print(f"  Detecting BPM from click track...")
+                bpm = detect_bpm(str(click_path))
+                if bpm:
+                    print(f"  BPM: {bpm}")
+                else:
+                    print("  BPM: (detection failed)")
+
+            # Process individual stems
+            max_duration = 0.0
+            track_number = 0
+            song_tracks = []
+            song_wavs = []
+
+            for num, stem_name, path, _ in stems:
+                # Check if silent
+                if wav_is_silent(str(path)):
+                    print(f"  Skipping silent track: {path.name}")
+                    continue
+
+                track_number += 1
+                track_id = str(uuid.uuid4()).upper()
+                dur = wav_duration(str(path))
+                max_duration = max(max_duration, dur)
+
+                bus = STEM_BUS_MAP.get(stem_name, DEFAULT_BUS)
+
+                # Convert WAV→MP3 if enabled
+                if do_convert:
+                    mp3_name = path.stem + ".mp3"
+                    zip_file_path = f"{dir_name}/{mp3_name}"
+                    mp3_path = convert_wav_to_mp3(str(path))
+                    temp_mp3_files.append(mp3_path)
+                    local_file = Path(mp3_path)
+                else:
+                    zip_file_path = f"{dir_name}/{path.name}"
+                    local_file = path
+
+                track = make_track(
+                    track_id=track_id,
+                    song_id=song_id,
+                    number=track_number,
+                    file_path=zip_file_path,
+                    bus=bus,
+                    duration=dur,
+                    name="",
+                )
+                song_tracks.append(track)
+                song_wavs.append((zip_file_path, local_file))
+                fmt = "mp3" if do_convert else "wav"
+                print(f"  Track {track_number}: {stem_name} → bus {bus + 1} ({dur:.1f}s) [{fmt}]")
+
+            if not song_tracks:
+                print(f"  No non-silent tracks — skipping song")
                 continue
 
-            track_number += 1
-            track_id = str(uuid.uuid4()).upper()
-            dur = wav_duration(str(path))
-            max_duration = max(max_duration, dur)
-
-            bus = STEM_BUS_MAP.get(stem_name, DEFAULT_BUS)
-
-            # Convert WAV→MP3 if enabled
-            if do_convert:
-                mp3_name = path.stem + ".mp3"
-                zip_file_path = f"{dir_name}/{mp3_name}"
-                mp3_path = convert_wav_to_mp3(str(path))
-                temp_mp3_files.append(mp3_path)
-                local_file = Path(mp3_path)
-            else:
-                zip_file_path = f"{dir_name}/{path.name}"
-                local_file = path
-
-            track = make_track(
-                track_id=track_id,
+            # Build song entry
+            song_entry = make_song(
                 song_id=song_id,
-                number=track_number,
-                file_path=zip_file_path,
-                bus=bus,
-                duration=dur,
-                name="",
+                title=canonical_title,
+                artist=artist,
+                duration=max_duration,
+                bpm=bpm,
+                lyrics=lyrics,
+                year=year,
             )
-            song_tracks.append(track)
-            song_wavs.append((zip_file_path, local_file))
-            fmt = "mp3" if do_convert else "wav"
-            print(f"  Track {track_number}: {stem_name} → bus {bus + 1} ({dur:.1f}s) [{fmt}]")
+            new_song_entries.append(song_entry)
+            new_track_entries.extend(song_tracks)
+            new_wav_files.extend(song_wavs)
 
-        if not song_tracks:
-            print(f"  No non-silent tracks — skipping song")
-            continue
-
-        # Build song entry
-        song_entry = make_song(
-            song_id=song_id,
-            title=canonical_title,
-            artist=artist,
-            duration=max_duration,
-            bpm=bpm,
-            lyrics=lyrics,
-        )
-        new_song_entries.append(song_entry)
-        new_track_entries.extend(song_tracks)
-        new_wav_files.extend(song_wavs)
-
-    if not new_song_entries:
-        print("\nNo songs to add after processing.")
+    # ── Write output ─────────────────────────────────────────────────────
+    if csv_added == 0 and not new_song_entries:
+        print("\nNo new songs to add.")
         sys.exit(0)
 
-    # ── Build output .st4b ───────────────────────────────────────────────
-    print(f"\nWriting output: {output_path}")
+    if filtered_songs is not None:
+        # Stems ran — merge filtered existing + new stem songs/tracks
+        backup_json["songs"] = filtered_songs + new_song_entries
+        backup_json["tracks"] = filtered_tracks + new_track_entries
+    # else: only CSV ran; backup_json["songs"] already updated by bulk_import_csv
 
-    # Merge into backup data
-    all_songs = filtered_songs + new_song_entries
-    all_tracks = filtered_tracks + new_track_entries
-    backup_json["songs"] = all_songs
-    backup_json["tracks"] = all_tracks
-
-    # Update metadata timestamp
     backup_json["metadata"]["created"] = datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
 
     updated_json = json.dumps(backup_json, sort_keys=True, indent=2, ensure_ascii=False)
 
+    print(f"\nWriting output: {output_path}")
     with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zout:
         # Copy existing entries (except backup_data.json and replaced dirs)
         with zipfile.ZipFile(str(input_path), "r") as zin:
             for item in zin.infolist():
                 if item.filename == "backup_data.json":
                     continue
-                # Skip entries from replaced songs
                 skip = False
                 for prefix in replaced_dir_prefixes:
                     if item.filename.startswith(prefix + "/") or item.filename == prefix:
@@ -1058,26 +1015,25 @@ def main():
                         break
                 if skip:
                     continue
-                # Preserve original entry metadata by copying ZipInfo
                 data = zin.read(item.filename)
                 zout.writestr(item, data)
 
-        # Write new audio files
         for zip_path, local_path in new_wav_files:
             print(f"  Adding: {zip_path}")
             zout.write(str(local_path), zip_path)
 
-        # Write updated backup_data.json
         zout.writestr("backup_data.json", updated_json)
 
-    # Clean up temp MP3 files
     for tmp in temp_mp3_files:
         try:
             os.unlink(tmp)
         except OSError:
             pass
 
-    print(f"\nDone! Added {len(new_song_entries)} song(s) with {len(new_track_entries)} track(s).")
+    if csv_added:
+        print(f"\nCSV: added {csv_added} song(s).")
+    if new_song_entries:
+        print(f"Stems: added {len(new_song_entries)} song(s) with {len(new_track_entries)} track(s).")
     print(f"Output: {output_path}")
 
 
