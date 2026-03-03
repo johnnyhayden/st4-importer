@@ -18,7 +18,7 @@ import zipfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -377,8 +377,17 @@ def lookup_itunes(title, artist=None):
         params = quote(f"{search_artist} {term}" if search_artist else term)
         url = f"https://itunes.apple.com/search?term={params}&media=music&entity=song&limit=10"
         req = Request(url)
-        with urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read()).get("results", [])
+        for attempt in range(3):
+            try:
+                with urlopen(req, timeout=10) as resp:
+                    return json.loads(resp.read()).get("results", [])
+            except HTTPError as e:
+                if e.code == 429 and attempt < 2:
+                    wait = 5 * (attempt + 1)
+                    print(f"  [iTunes rate limited, retrying in {wait}s...]")
+                    time.sleep(wait)
+                else:
+                    raise
 
     def _best_match(results, strict=False):
         """Return the result whose trackName best matches the query title.
@@ -581,6 +590,9 @@ def bulk_import_csv(csv_path, backup_json):
 
     for i, row in enumerate(rows, 1):
         title = row.get("Track Name", "").strip()
+        title = re.sub(r"\s*\([^)]*\)", "", title)  # remove parenthetical text
+        title = re.sub(r"\s*-.*$", "", title)        # remove dash suffix
+        title = title.strip()
         csv_artist = row.get("Artist Name(s)", "").strip()
         duration_ms_str = row.get("Duration (ms)", "0")
         tempo_str = row.get("Tempo", "0")
