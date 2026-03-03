@@ -1,8 +1,13 @@
-# Stage Traxx 4 Stem Importer
+# StageTraxx4 Importer
 
-A Python command-line tool that imports WAV stem files into a StageTraxx4 backup (`.st4b`) file. It parses structured stem filenames, auto-detects metadata from iTunes and lyrics from Genius, detects BPM from click tracks, skips silent stems, and optionally converts WAV to MP3 — producing a ready-to-restore `.st4b` backup.
+A Python command-line tool for building StageTraxx4 backup (`.st4b`) files. It supports two import modes:
+
+- **Stem import** — imports WAV stem files, auto-detects metadata from iTunes and lyrics from Genius, detects BPM from click tracks, skips silent stems, and optionally converts WAV to MP3.
+- **CSV bulk import** — imports a Spotify-export CSV to create song entries (no audio tracks) enriched with lyrics from Genius, using BPM and duration from the CSV.
 
 ## What It Does
+
+### Stem Import (default)
 
 1. **Reads an existing `.st4b` backup** (a ZIP archive containing `backup_data.json` and audio files).
 2. **Scans a directory of WAV stems** named in the format `SongName_XX_StemName.wav` (e.g., `Dreams_01_Click.wav`, `Dreams_02_Drums.wav`).
@@ -12,9 +17,23 @@ A Python command-line tool that imports WAV stem files into a StageTraxx4 backup
    - **Detects BPM** by analyzing peak intervals in the click track (if present).
    - **Skips silent stems** automatically.
    - **Converts WAV to 192kbps MP3** using ffmpeg (unless `--no-convert` is passed).
+   - **Aligns lyrics to the lead vocal** using forced alignment (aeneas), producing LRC-style `[MM:SS.cc]` timestamps for synchronized lyric scrolling in StageTraxx 4.
    - **Assigns each stem to a bus** based on a built-in name-to-bus mapping (Click, Drums, Bass, Guitar, Keys, Pad, Vocals, Cues, etc.).
 4. **Detects duplicate songs** already in the backup and prompts to skip or replace.
 5. **Writes a new `.st4b` file** with the imported songs merged into the existing backup data.
+
+### CSV Bulk Import (`--csv`)
+
+1. **Reads an existing `.st4b` backup**.
+2. **Parses a Spotify-export CSV** with columns like `Track Name`, `Artist Name(s)`, `Duration (ms)`, `Tempo`, etc.
+3. **For each row**, creates a song entry (no audio tracks):
+   - Uses the CSV artist to look up the **canonical title** via iTunes.
+   - Fetches **lyrics** from Genius using the CSV artist.
+   - Takes **BPM** directly from the CSV `Tempo` column.
+   - Converts **duration** from milliseconds to seconds.
+   - Calculates **scroll speed** from lyrics density (characters per second of song duration).
+4. **Skips duplicates** automatically (non-interactive) by comparing normalized titles against existing songs.
+5. **Writes a new `.st4b` file** with the song entries merged into the existing backup.
 
 ## Assumptions
 
@@ -42,6 +61,18 @@ brew install ffmpeg
 
 If ffmpeg is not found, the tool will print a warning and keep the original WAV files instead of converting. You can also explicitly skip conversion with the `--no-convert` flag.
 
+### espeak (for lyric alignment)
+
+When a `Vocals_Lead` stem is present, the tool can align fetched lyrics to the vocal audio using [aeneas](https://github.com/readbeyond/aeneas), producing timestamped LRC lyrics for synchronized scrolling in StageTraxx 4. This requires espeak (a speech synthesis engine) to be installed.
+
+**Install with Homebrew (macOS):**
+
+```bash
+brew install espeak
+```
+
+If espeak and aeneas are not found, the tool will print a warning and use plain (un-timed) lyrics instead. You can also skip alignment with the `--no-align` flag.
+
 ### Python Dependencies
 
 ```bash
@@ -50,6 +81,8 @@ pip install -r requirements.txt
 
 This installs:
 - `lyricsgenius` — Python client for the Genius API (used for lyrics lookup)
+- `numpy` — required by aeneas
+- `aeneas` — forced alignment library for syncing lyrics to audio
 
 ## Usage
 
@@ -61,10 +94,16 @@ python st4_import.py <input.st4b> [options]
 
 | Flag | Description |
 |---|---|
-| `--stems <dir>` | Path to the stems directory. Defaults to `./Stems`. |
+| `--csv <file>` | Path to a Spotify-export CSV for bulk song import. Mutually exclusive with `--stems`. |
+| `--stems <dir>` | Path to the stems directory. Defaults to `./Stems`. Mutually exclusive with `--csv`. |
 | `-o, --output <file>` | Output `.st4b` file path. Defaults to `<input>_imported.st4b`. |
-| `--dry-run` | Preview what would be imported without writing any files. |
-| `--no-convert` | Keep original WAV files instead of converting to MP3. |
+| `--dry-run` | Preview what would be imported without writing any files. (Stems mode only.) |
+| `--no-convert` | Keep original WAV files instead of converting to MP3. (Stems mode only.) |
+| `--no-align` | Skip forced alignment of lyrics to lead vocal. (Stems mode only.) |
+
+### Generating a Spotify CSV
+
+The `--csv` mode expects a CSV exported from Spotify. Use [Exportify](https://exportify.net/) to export any of your Spotify playlists as a CSV file with the required columns (`Track Name`, `Artist Name(s)`, `Duration (ms)`, `Tempo`, etc.).
 
 ### Examples
 
@@ -74,7 +113,19 @@ Import stems from the default `./Stems` directory:
 python st4_import.py MyBackup.st4b
 ```
 
-Dry run to preview without modifying anything:
+Bulk import songs from a Spotify-export CSV:
+
+```bash
+python st4_import.py MyBackup.st4b --csv songs.csv
+```
+
+Specify a custom output file:
+
+```bash
+python st4_import.py MyBackup.st4b --csv songs.csv -o NewBackup.st4b
+```
+
+Dry run to preview stem import without modifying anything:
 
 ```bash
 python st4_import.py MyBackup.st4b --dry-run

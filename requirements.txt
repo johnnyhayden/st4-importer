@@ -1,1 +1,3 @@
 lyricsgenius
+numpy
+aeneas

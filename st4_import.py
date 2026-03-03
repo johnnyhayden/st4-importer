@@ -2,6 +2,7 @@
 """StageTraxx4 Stem Importer - imports WAV stems into a .st4b backup file."""
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -59,6 +60,94 @@ DEFAULT_EQ = {
 def ffmpeg_available():
     """Return True if ffmpeg is on PATH."""
     return shutil.which("ffmpeg") is not None
+
+
+def aeneas_available():
+    """Return True if aeneas and espeak are available."""
+    try:
+        from aeneas.executetask import ExecuteTask
+        from aeneas.task import Task
+    except ImportError:
+        return False
+    return shutil.which("espeak") is not None or shutil.which("espeak-ng") is not None
+
+
+def _format_lrc_timestamp(seconds):
+    """Convert float seconds to [MM:SS.cc] LRC timestamp."""
+    minutes = int(seconds) // 60
+    secs = seconds - minutes * 60
+    return f"[{minutes:02d}:{secs:05.2f}]"
+
+
+def align_lyrics_to_audio(lyrics_text, audio_wav_path):
+    """Align lyrics to audio using aeneas forced alignment. Returns LRC string or None."""
+    try:
+        from aeneas.executetask import ExecuteTask
+        from aeneas.task import Task
+
+        lines = lyrics_text.split("\n")
+        # Track which lines are non-blank (for alignment) and which are blank (preserved as-is)
+        non_blank_lines = []
+        non_blank_indices = []
+        for i, line in enumerate(lines):
+            if line.strip():
+                non_blank_lines.append(line)
+                non_blank_indices.append(i)
+
+        if not non_blank_lines:
+            return None
+
+        # Write non-blank lines to a temp file for aeneas
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as tf:
+            tf.write("\n".join(non_blank_lines))
+            text_path = tf.name
+
+        try:
+            config = "task_language=eng|is_text_type=plain|os_task_file_format=json"
+            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as out_f:
+                out_path = out_f.name
+
+            task = Task(config_string=config)
+            task.audio_file_path_absolute = audio_wav_path
+            task.text_file_path_absolute = text_path
+            task.sync_map_file_path_absolute = out_path
+            ExecuteTask(task).execute()
+            task.output_sync_map_file()
+
+            with open(out_path, "r", encoding="utf-8") as f:
+                sync_data = json.load(f)
+
+            fragments = sync_data.get("fragments", [])
+            if len(fragments) != len(non_blank_lines):
+                return None
+
+            # Build timestamp map: original line index -> timestamp
+            timestamp_map = {}
+            for idx, frag in zip(non_blank_indices, fragments):
+                begin = float(frag.get("begin", 0))
+                timestamp_map[idx] = begin
+
+            # Reconstruct full lyrics with timestamps on text lines, blank lines preserved
+            result_lines = []
+            for i, line in enumerate(lines):
+                if i in timestamp_map:
+                    result_lines.append(f"{_format_lrc_timestamp(timestamp_map[i])}{line}")
+                else:
+                    result_lines.append(line)
+
+            return "\n".join(result_lines)
+        finally:
+            try:
+                os.unlink(text_path)
+            except OSError:
+                pass
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+    except Exception as e:
+        print(f"  [Aeneas alignment error: {e}]")
+        return None
 
 
 def convert_wav_to_mp3(wav_path, bitrate="192k"):
@@ -245,16 +334,18 @@ def _get_genius():
     return _genius_client
 
 
-def lookup_itunes(title):
+def lookup_itunes(title, artist=None):
     """Look up artist and canonical title via iTunes Search API.
 
-    Tries each artist in METADATA_ARTIST_ORDER, returning the first match.
+    If artist is provided, tries that artist first (strict match), then falls
+    back to METADATA_ARTIST_ORDER and finally an unqualified search.
+    Otherwise tries each artist in METADATA_ARTIST_ORDER, returning the first match.
     Falls back to an unqualified search if no artist-specific match is found.
     """
     norm_query = normalize_title(title)
 
-    def _search(term, artist=None):
-        params = quote(f"{artist} {term}" if artist else term)
+    def _search(term, search_artist=None):
+        params = quote(f"{search_artist} {term}" if search_artist else term)
         url = f"https://itunes.apple.com/search?term={params}&media=music&entity=song&limit=10"
         req = Request(url)
         with urlopen(req, timeout=10) as resp:
@@ -274,16 +365,16 @@ def lookup_itunes(title):
         return None
 
     def _extract(result):
-        artist = result.get("artistName", "")
+        found_artist = result.get("artistName", "")
         canonical = result.get("trackName", title)
         year = None
         release_date = result.get("releaseDate", "")
         if release_date:
             year = release_date[:4]
-        return artist, canonical, year
+        return found_artist, canonical, year
 
-    # Try each preferred artist in order (strict: title must match)
-    for artist in METADATA_ARTIST_ORDER:
+    # If a specific artist was provided, try that first (strict match)
+    if artist:
         try:
             results = _search(title, artist)
             match = _best_match(results, strict=True)
@@ -291,6 +382,18 @@ def lookup_itunes(title):
                 return _extract(match)
         except (URLError, OSError, json.JSONDecodeError, KeyError) as e:
             print(f"  [iTunes lookup failed for '{artist}': {e}]")
+
+    # Try each preferred artist in order (strict: title must match)
+    for preferred_artist in METADATA_ARTIST_ORDER:
+        if preferred_artist == artist:
+            continue  # already tried above
+        try:
+            results = _search(title, preferred_artist)
+            match = _best_match(results, strict=True)
+            if match:
+                return _extract(match)
+        except (URLError, OSError, json.JSONDecodeError, KeyError) as e:
+            print(f"  [iTunes lookup failed for '{preferred_artist}': {e}]")
 
     # Fallback: search with just the title
     try:
@@ -315,18 +418,23 @@ def _clean_genius_lyrics(lyrics):
     text = "\n".join(lines)
     # Remove preamble up to and including "Read More" (contributor counts, descriptions)
     text = re.sub(r"(?si)^.*?Read More\s*", "", text)
+    # Remove contributor count lines (e.g. "7 Contributors") that may appear without "Read More"
+    text = re.sub(r"(?m)^\d+\s+Contributors?\s*\n?", "", text)
     # Remove trailing "Embed" or "...Embed" text Genius appends
     text = re.sub(r"\d*Embed$", "", text).rstrip()
     return text
 
 
 def lookup_lyrics(title, artist=""):
-    """Look up lyrics via Genius API, trying preferred artists first."""
+    """Look up lyrics via Genius API, trying the given artist first, then preferred artists."""
     genius = _get_genius()
-    # Build list of artists to try: preferred order first, then MB-discovered artist
-    artists_to_try = list(LYRICS_ARTIST_ORDER)
-    if artist and artist not in artists_to_try:
+    # Build list of artists to try: given artist first, then preferred order
+    artists_to_try = []
+    if artist:
         artists_to_try.append(artist)
+    for a in LYRICS_ARTIST_ORDER:
+        if a not in artists_to_try:
+            artists_to_try.append(a)
 
     for try_artist in artists_to_try:
         try:
@@ -409,6 +517,117 @@ def make_track(track_id, song_id, number, file_path, bus, duration, name):
     }
 
 
+# ── CSV bulk import ──────────────────────────────────────────────────────────
+
+
+def calculate_scroll_speed(lyrics, duration_seconds):
+    """Calculate scroll speed based on lyrics density (chars per second).
+
+    Returns a value between 0.5 and 2.0, defaulting to 1.2 if no lyrics.
+    """
+    if not lyrics or duration_seconds <= 0:
+        return 1.2
+    density = len(lyrics) / duration_seconds
+    # Linear map: density 2 -> 0.8, density 12 -> 1.5
+    speed = 0.8 + (density - 2) * (1.5 - 0.8) / (12 - 2)
+    return round(max(0.5, min(2.0, speed)), 2)
+
+
+def bulk_import_csv(csv_path, backup_json):
+    """Import songs from a Spotify-export CSV into the backup JSON.
+
+    Creates song entries only (no audio tracks), enriched with lyrics and BPM.
+    """
+    existing_songs = backup_json.get("songs", [])
+    existing_norm_titles = {normalize_title(s["title"]) for s in existing_songs}
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    print(f"CSV contains {len(rows)} row(s)\n")
+    added = 0
+    skipped = 0
+
+    for i, row in enumerate(rows, 1):
+        title = row.get("Track Name", "").strip()
+        csv_artist = row.get("Artist Name(s)", "").strip()
+        duration_ms_str = row.get("Duration (ms)", "0")
+        tempo_str = row.get("Tempo", "0")
+
+        if not title:
+            print(f"  [{i}/{len(rows)}] Skipping row with empty title")
+            skipped += 1
+            continue
+
+        # Duplicate detection
+        norm = normalize_title(title)
+        if norm in existing_norm_titles:
+            print(f"  [{i}/{len(rows)}] SKIP (duplicate): \"{title}\"")
+            skipped += 1
+            continue
+
+        print(f"  [{i}/{len(rows)}] \"{title}\" by {csv_artist}")
+
+        # Duration
+        try:
+            duration_ms = int(float(duration_ms_str))
+        except (ValueError, TypeError):
+            duration_ms = 0
+        duration_seconds = duration_ms / 1000.0
+
+        # BPM from CSV Tempo column
+        try:
+            bpm = round(float(tempo_str))
+        except (ValueError, TypeError):
+            bpm = 0
+
+        # iTunes lookup with CSV artist hint
+        print("    Looking up on iTunes...")
+        itunes_artist, canonical_title, year = lookup_itunes(title, artist=csv_artist)
+        if itunes_artist:
+            print(f"    Artist: {itunes_artist}")
+        else:
+            itunes_artist = csv_artist
+            print(f"    Artist: {csv_artist} (from CSV)")
+
+        if canonical_title and canonical_title != title:
+            print(f"    Canonical title: {canonical_title}")
+        else:
+            canonical_title = title
+
+        # Lyrics lookup using CSV artist directly
+        print("    Looking up lyrics on Genius...")
+        lyrics = lookup_lyrics(canonical_title, csv_artist)
+        if lyrics:
+            print(f"    Lyrics: found ({len(lyrics)} chars)")
+        else:
+            print("    Lyrics: (not found)")
+
+        # Scroll speed
+        scroll_speed = calculate_scroll_speed(lyrics, duration_seconds)
+
+        # Build song entry
+        song_id = str(uuid.uuid4()).upper()
+        song_entry = make_song(
+            song_id=song_id,
+            title=canonical_title,
+            artist=itunes_artist,
+            duration=duration_seconds,
+            bpm=bpm,
+            lyrics=lyrics,
+        )
+        song_entry["scrollSpeed"] = scroll_speed
+        print(f"    BPM: {bpm}, Duration: {duration_seconds:.1f}s, Scroll: {scroll_speed}")
+
+        backup_json.setdefault("songs", []).append(song_entry)
+        existing_norm_titles.add(normalize_title(canonical_title))
+        added += 1
+
+    print(f"\nCSV import complete: {added} added, {skipped} skipped")
+    return added
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -441,9 +660,13 @@ def group_stems(stems_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Import WAV stems into a StageTraxx4 backup (.st4b)"
+        description="Import WAV stems or CSV song list into a StageTraxx4 backup (.st4b)"
     )
     parser.add_argument("input", help="Existing .st4b backup file")
+    parser.add_argument(
+        "--csv", type=Path, default=None,
+        help="CSV file for bulk song import (mutually exclusive with --stems)",
+    )
     parser.add_argument(
         "--stems", type=Path, default=None, help="Stems directory (default: ./Stems)"
     )
@@ -457,22 +680,19 @@ def main():
         "--no-convert", action="store_true",
         help="Keep original WAV files instead of converting to 192kbps MP3",
     )
+    parser.add_argument(
+        "--no-align", action="store_true",
+        help="Skip forced alignment of lyrics to lead vocal",
+    )
     args = parser.parse_args()
 
-    # Determine whether to convert WAV→MP3
-    do_convert = not args.no_convert
-    if do_convert and not ffmpeg_available():
-        print("Warning: ffmpeg not found on PATH — skipping MP3 conversion (keeping WAV)")
-        do_convert = False
+    if args.csv and args.stems:
+        print("Error: --csv and --stems are mutually exclusive.")
+        sys.exit(1)
 
     input_path = Path(args.input)
     if not input_path.exists():
         print(f"Error: Input file not found: {input_path}")
-        sys.exit(1)
-
-    stems_dir = args.stems or find_stems_dir()
-    if stems_dir is None or not stems_dir.is_dir():
-        print(f"Error: Stems directory not found. Use --stems to specify.")
         sys.exit(1)
 
     if args.output:
@@ -481,6 +701,62 @@ def main():
         output_path = input_path.with_name(
             input_path.stem + "_imported" + input_path.suffix
         )
+
+    # ── CSV bulk import mode ────────────────────────────────────────────
+    if args.csv:
+        if not args.csv.exists():
+            print(f"Error: CSV file not found: {args.csv}")
+            sys.exit(1)
+
+        print(f"Reading backup: {input_path}")
+        with zipfile.ZipFile(str(input_path), "r") as zin:
+            backup_json = json.loads(zin.read("backup_data.json"))
+
+        added = bulk_import_csv(str(args.csv), backup_json)
+
+        if added == 0:
+            print("No new songs to add.")
+            sys.exit(0)
+
+        # Update metadata timestamp
+        backup_json["metadata"]["created"] = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        updated_json = json.dumps(backup_json, sort_keys=True, indent=2, ensure_ascii=False)
+
+        print(f"\nWriting output: {output_path}")
+        with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zout:
+            # Copy existing entries except backup_data.json
+            with zipfile.ZipFile(str(input_path), "r") as zin:
+                for item in zin.infolist():
+                    if item.filename == "backup_data.json":
+                        continue
+                    data = zin.read(item.filename)
+                    zout.writestr(item, data)
+            # Write updated backup_data.json
+            zout.writestr("backup_data.json", updated_json)
+
+        print(f"\nDone! Added {added} song(s).")
+        print(f"Output: {output_path}")
+        return
+
+    # ── Stems import mode ───────────────────────────────────────────────
+    # Determine whether to convert WAV→MP3
+    do_convert = not args.no_convert
+    if do_convert and not ffmpeg_available():
+        print("Warning: ffmpeg not found on PATH — skipping MP3 conversion (keeping WAV)")
+        do_convert = False
+
+    do_align = not args.no_align
+    if do_align and not aeneas_available():
+        print("Warning: aeneas/espeak not found — skipping lyric alignment")
+        do_align = False
+
+    stems_dir = args.stems or find_stems_dir()
+    if stems_dir is None or not stems_dir.is_dir():
+        print(f"Error: Stems directory not found. Use --stems to specify.")
+        sys.exit(1)
 
     # ── Read existing backup ─────────────────────────────────────────────
     print(f"Reading backup: {input_path}")
@@ -601,6 +877,19 @@ def main():
             print(f"  Lyrics: found ({len(lyrics)} chars)")
         else:
             print("  Lyrics: (not found)")
+
+        # Align lyrics to lead vocal
+        if lyrics and do_align:
+            lead_vocal_stems = [s for s in stems if s[1] == "Vocals_Lead"]
+            if lead_vocal_stems:
+                vocal_wav_path = lead_vocal_stems[0][2]
+                print("  Aligning lyrics to lead vocal...")
+                lrc_lyrics = align_lyrics_to_audio(lyrics, str(vocal_wav_path))
+                if lrc_lyrics:
+                    lyrics = lrc_lyrics
+                    print(f"  Lyrics aligned ({lyrics.count(chr(10)) + 1} lines)")
+                else:
+                    print("  Alignment failed, using plain text")
 
         # Detect BPM from click track
         bpm = 0
