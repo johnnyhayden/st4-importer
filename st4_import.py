@@ -389,15 +389,33 @@ def lookup_itunes(title, artist=None):
                 else:
                     raise
 
-    def _best_match(results, strict=False):
+    def _norm_track(name):
+        """Normalize track name, stripping parenthetical suffixes like (Remastered)."""
+        name = re.sub(r"\s*\(.*?\)\s*", " ", name)
+        return normalize_title(name)
+
+    def _best_match(results, strict=False, search_artist=None):
         """Return the result whose trackName best matches the query title.
 
         If strict, only return an exact normalized match (used for per-artist
         searches so we don't grab an unrelated song by the same artist).
+        If search_artist is provided, prefer results whose artist matches.
         """
-        for r in results:
-            if normalize_title(r.get("trackName", "")) == norm_query:
-                return r
+        norm_artist = normalize_title(search_artist) if search_artist else None
+
+        # First pass: match title AND artist
+        if norm_artist:
+            for r in results:
+                if _norm_track(r.get("trackName", "")) == norm_query:
+                    if normalize_title(r.get("artistName", "")).startswith(norm_artist):
+                        return r
+
+        # Second pass: match title only (skip if strict with a specific artist)
+        if not (strict and norm_artist):
+            for r in results:
+                if _norm_track(r.get("trackName", "")) == norm_query:
+                    return r
+
         if not strict:
             return results[0] if results else None
         return None
@@ -415,7 +433,7 @@ def lookup_itunes(title, artist=None):
     if artist:
         try:
             results = _search(title, artist)
-            match = _best_match(results, strict=True)
+            match = _best_match(results, strict=True, search_artist=artist)
             if match:
                 return _extract(match)
         except (URLError, OSError, json.JSONDecodeError, KeyError) as e:
@@ -427,7 +445,7 @@ def lookup_itunes(title, artist=None):
             continue  # already tried above
         try:
             results = _search(title, preferred_artist)
-            match = _best_match(results, strict=True)
+            match = _best_match(results, strict=True, search_artist=preferred_artist)
             if match:
                 return _extract(match)
         except (URLError, OSError, json.JSONDecodeError, KeyError) as e:
