@@ -263,6 +263,11 @@ def detect_bpm(path):
         if n_channels > 1:
             samples = samples[::n_channels]
 
+        # Skip the first 10 seconds to avoid silent lead-in skewing BPM
+        skip_samples = framerate * 10
+        if len(samples) > skip_samples * 2:
+            samples = samples[skip_samples:]
+
         max_val = max(abs(s) for s in samples) if samples else 0
         if max_val == 0:
             return 0
