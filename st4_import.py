@@ -601,7 +601,7 @@ def bulk_import_csv(csv_path, backup_json):
     Creates song entries only (no audio tracks), enriched with lyrics and BPM.
     """
     existing_songs = backup_json.get("songs", [])
-    existing_norm_titles = {normalize_title(s["title"]) for s in existing_songs}
+    existing_norm_titles = {normalize_title(s["title"]): s for s in existing_songs}
 
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -610,6 +610,8 @@ def bulk_import_csv(csv_path, backup_json):
     print(f"CSV contains {len(rows)} row(s)\n")
     added = 0
     skipped = 0
+    replaced = 0
+    dup_policy = None  # None = ask each time, "skip_all", "replace_all"
 
     for i, row in enumerate(rows, 1):
         title = row.get("Track Name", "").strip()
@@ -628,9 +630,50 @@ def bulk_import_csv(csv_path, backup_json):
         # Duplicate detection
         norm = normalize_title(title)
         if norm in existing_norm_titles:
-            print(f"  [{i}/{len(rows)}] SKIP (duplicate): \"{title}\"")
-            skipped += 1
-            continue
+            existing = existing_norm_titles[norm]
+            existing_title = existing["title"] if isinstance(existing, dict) else title
+
+            if dup_policy == "skip_all":
+                print(f"  [{i}/{len(rows)}] SKIP (duplicate, skip all): \"{title}\"")
+                skipped += 1
+                continue
+            elif dup_policy == "replace_all":
+                print(f"  [{i}/{len(rows)}] REPLACE (duplicate, replace all): \"{title}\"")
+                # Remove the existing song so it gets replaced
+                backup_json["songs"] = [s for s in backup_json["songs"]
+                                        if normalize_title(s["title"]) != norm]
+                replaced += 1
+                # Fall through to re-import
+            else:
+                print(f"  [{i}/{len(rows)}] DUPLICATE: \"{title}\" matches existing \"{existing_title}\"")
+                while True:
+                    choice = input(f"    [s]kip / [r]eplace / skip [a]ll / replace a[l]l? ").strip().lower()
+                    if choice in ("s", "skip"):
+                        print(f"    Skipping \"{title}\"")
+                        skipped += 1
+                        break
+                    elif choice in ("r", "replace"):
+                        print(f"    Will replace \"{existing_title}\"")
+                        backup_json["songs"] = [s for s in backup_json["songs"]
+                                                if normalize_title(s["title"]) != norm]
+                        replaced += 1
+                        break
+                    elif choice in ("a", "skip all"):
+                        print(f"    Skipping all duplicates")
+                        dup_policy = "skip_all"
+                        skipped += 1
+                        break
+                    elif choice in ("l", "replace all"):
+                        print(f"    Replacing all duplicates")
+                        dup_policy = "replace_all"
+                        backup_json["songs"] = [s for s in backup_json["songs"]
+                                                if normalize_title(s["title"]) != norm]
+                        replaced += 1
+                        break
+                    else:
+                        print("    Please enter 's', 'r', 'a' (skip all), or 'l' (replace all)")
+                if choice in ("s", "skip", "a", "skip all"):
+                    continue
 
         print(f"  [{i}/{len(rows)}] \"{title}\" by {csv_artist}")
 
@@ -689,10 +732,10 @@ def bulk_import_csv(csv_path, backup_json):
         print(f"    BPM: {bpm}, Duration: {duration_seconds:.1f}s, Scroll: {scroll_speed}")
 
         backup_json.setdefault("songs", []).append(song_entry)
-        existing_norm_titles.add(normalize_title(canonical_title))
+        existing_norm_titles[normalize_title(canonical_title)] = song_entry
         added += 1
 
-    print(f"\nCSV import complete: {added} added, {skipped} skipped")
+    print(f"\nCSV import complete: {added} added, {skipped} skipped, {replaced} replaced")
     return added
 
 
@@ -831,6 +874,7 @@ def main():
         # ── Detect duplicates ────────────────────────────────────────────
         new_songs_to_add = {}  # song_name -> stems list
         songs_to_replace = {}  # song_name -> existing song dict
+        dup_policy = None  # None = ask each time, "skip_all", "replace_all"
 
         for song_name in sorted(stem_groups.keys()):
             norm = normalize_title(song_name)
@@ -840,9 +884,18 @@ def main():
                     print(f"  DUPLICATE: \"{song_name}\" matches existing \"{existing['title']}\" — would prompt")
                     continue
 
+                if dup_policy == "skip_all":
+                    print(f"  DUPLICATE: \"{song_name}\" matches existing \"{existing['title']}\" — skipping (skip all)")
+                    continue
+                elif dup_policy == "replace_all":
+                    print(f"  DUPLICATE: \"{song_name}\" matches existing \"{existing['title']}\" — replacing (replace all)")
+                    songs_to_replace[song_name] = existing
+                    new_songs_to_add[song_name] = stem_groups[song_name]
+                    continue
+
                 print(f"  DUPLICATE: \"{song_name}\" matches existing \"{existing['title']}\"")
                 while True:
-                    choice = input(f"    [s]kip or [r]eplace? ").strip().lower()
+                    choice = input(f"    [s]kip / [r]eplace / skip [a]ll / replace a[l]l? ").strip().lower()
                     if choice in ("s", "skip"):
                         print(f"    Skipping \"{song_name}\"")
                         break
@@ -851,8 +904,18 @@ def main():
                         songs_to_replace[song_name] = existing
                         new_songs_to_add[song_name] = stem_groups[song_name]
                         break
+                    elif choice in ("a", "skip all"):
+                        print(f"    Skipping all duplicates")
+                        dup_policy = "skip_all"
+                        break
+                    elif choice in ("l", "replace all"):
+                        print(f"    Replacing all duplicates")
+                        dup_policy = "replace_all"
+                        songs_to_replace[song_name] = existing
+                        new_songs_to_add[song_name] = stem_groups[song_name]
+                        break
                     else:
-                        print("    Please enter 's' or 'r'")
+                        print("    Please enter 's', 'r', 'a' (skip all), or 'l' (replace all)")
             else:
                 new_songs_to_add[song_name] = stem_groups[song_name]
 
