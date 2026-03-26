@@ -272,7 +272,7 @@ def detect_bpm(path):
         if max_val == 0:
             return 0
 
-        threshold = max_val * 0.5
+        threshold = max_val * 0.25
 
         # Find peaks: samples above threshold with at least min_gap between them
         min_gap = int(framerate * 0.15)  # 150ms minimum gap between beats
