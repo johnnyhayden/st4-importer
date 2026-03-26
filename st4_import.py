@@ -422,7 +422,7 @@ def lookup_itunes(title, artist=None):
 
     def _extract(result):
         found_artist = result.get("artistName", "")
-        canonical = result.get("trackName", title)
+        canonical = re.sub(r"\s*\(.*?\)\s*", " ", result.get("trackName", title)).strip()
         year = None
         release_date = result.get("releaseDate", "")
         if release_date:
