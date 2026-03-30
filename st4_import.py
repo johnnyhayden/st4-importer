@@ -805,10 +805,14 @@ def main():
         "--no-align", action="store_true",
         help="Skip forced alignment of lyrics to lead vocal",
     )
+    parser.add_argument(
+        "--refresh-stems", type=Path, default=None,
+        help="Re-process stems and replace audio files without touching metadata",
+    )
     args = parser.parse_args()
 
-    if not args.csv and not args.stems:
-        print("Error: provide --stems <dir>, --csv <file>, or both.")
+    if not args.csv and not args.stems and not args.refresh_stems:
+        print("Error: provide --stems <dir>, --csv <file>, --refresh-stems <dir>, or a combination.")
         sys.exit(1)
 
     input_path = Path(args.input)
@@ -818,6 +822,11 @@ def main():
 
     if args.output:
         output_path = Path(args.output)
+    elif args.refresh_stems:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = input_path.with_name(
+            input_path.stem + f"_{timestamp}" + input_path.suffix
+        )
     else:
         output_path = input_path.with_name(
             input_path.stem + "_imported" + input_path.suffix
@@ -1082,8 +1091,73 @@ def main():
             new_track_entries.extend(song_tracks)
             new_wav_files.extend(song_wavs)
 
+    # ── Refresh stems (audio-only replacement) ────────────────────────────
+    refresh_files = {}  # zip_path -> local_path (new audio to replace)
+
+    if args.refresh_stems:
+        refresh_dir = args.refresh_stems
+        if not refresh_dir.is_dir():
+            print(f"Error: Refresh stems directory not found: {refresh_dir}")
+            sys.exit(1)
+
+        do_convert = not args.no_convert
+        if do_convert and not ffmpeg_available():
+            print("Warning: ffmpeg not found on PATH — skipping MP3 conversion (keeping WAV)")
+            do_convert = False
+
+        existing_songs = backup_json.get("songs", [])
+        existing_tracks = backup_json.get("tracks", [])
+        norm_to_song = {normalize_title(s["title"]): s for s in existing_songs}
+
+        print(f"Scanning stems for refresh: {refresh_dir}")
+        stem_groups = group_stems(refresh_dir)
+        print(f"Found {len(stem_groups)} song(s): {', '.join(sorted(stem_groups.keys()))}\n")
+
+        refreshed_count = 0
+        for song_name in sorted(stem_groups.keys()):
+            norm = normalize_title(song_name)
+            if norm not in norm_to_song:
+                print(f"  Warning: No matching song in backup for \"{song_name}\" — skipping")
+                continue
+
+            matched_song = norm_to_song[norm]
+            song_id = matched_song["id"]
+            song_tracks = [t for t in existing_tracks if t["songID"] == song_id]
+
+            # Build map: stem_name -> track filePath
+            track_by_stem = {}
+            for t in song_tracks:
+                # filePath is like "Dreams__a1b2c3/Click.mp3"
+                base = t["filePath"].rsplit("/", 1)[-1]  # "Click.mp3"
+                stem_base = base.rsplit(".", 1)[0]  # "Click"
+                track_by_stem[stem_base] = t["filePath"]
+
+            print(f"  Refreshing: \"{matched_song['title']}\"")
+            stems = stem_groups[song_name]
+
+            for num, stem_name, path, _ in stems:
+                if stem_name not in track_by_stem:
+                    print(f"    Warning: No matching track for stem \"{stem_name}\" — skipping")
+                    continue
+
+                existing_zip_path = track_by_stem[stem_name]
+
+                if do_convert:
+                    mp3_path = convert_wav_to_mp3(str(path))
+                    temp_mp3_files.append(mp3_path)
+                    local_file = Path(mp3_path)
+                else:
+                    local_file = path
+
+                refresh_files[existing_zip_path] = local_file
+                fmt = "mp3" if do_convert else "wav"
+                print(f"    {stem_name} → {existing_zip_path} [{fmt}]")
+                refreshed_count += 1
+
+        print(f"\n  {refreshed_count} stem(s) matched for refresh")
+
     # ── Write output ─────────────────────────────────────────────────────
-    if csv_added == 0 and not new_song_entries:
+    if csv_added == 0 and not new_song_entries and not refresh_files:
         print("\nNo new songs to add.")
         sys.exit(0)
 
@@ -1091,11 +1165,13 @@ def main():
         # Stems ran — merge filtered existing + new stem songs/tracks
         backup_json["songs"] = filtered_songs + new_song_entries
         backup_json["tracks"] = filtered_tracks + new_track_entries
-    # else: only CSV ran; backup_json["songs"] already updated by bulk_import_csv
 
-    backup_json["metadata"]["created"] = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    # Only update metadata timestamp when not in refresh-only mode
+    if not (args.refresh_stems and not args.stems and not args.csv):
+        backup_json["metadata"]["created"] = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    # else: only CSV ran; backup_json["songs"] already updated by bulk_import_csv
 
     updated_json = json.dumps(backup_json, sort_keys=True, indent=2, ensure_ascii=False)
 
@@ -1113,6 +1189,11 @@ def main():
                         break
                 if skip:
                     continue
+                # If this file is being refreshed, write the new version instead
+                if item.filename in refresh_files:
+                    zout.write(str(refresh_files[item.filename]), item.filename)
+                    print(f"  Refreshed: {item.filename}")
+                    continue
                 data = zin.read(item.filename)
                 zout.writestr(item, data)
 
@@ -1120,7 +1201,12 @@ def main():
             print(f"  Adding: {zip_path}")
             zout.write(str(local_path), zip_path)
 
-        zout.writestr("backup_data.json", updated_json)
+        # In refresh-only mode, copy original JSON unchanged
+        if args.refresh_stems and not args.stems and not args.csv:
+            with zipfile.ZipFile(str(input_path), "r") as zin:
+                zout.writestr("backup_data.json", zin.read("backup_data.json"))
+        else:
+            zout.writestr("backup_data.json", updated_json)
 
     for tmp in temp_mp3_files:
         try:
@@ -1132,6 +1218,8 @@ def main():
         print(f"\nCSV: added {csv_added} song(s).")
     if new_song_entries:
         print(f"Stems: added {len(new_song_entries)} song(s) with {len(new_track_entries)} track(s).")
+    if refresh_files:
+        print(f"Refreshed {len(refresh_files)} stem(s) (metadata unchanged).")
     print(f"Output: {output_path}")
 
 

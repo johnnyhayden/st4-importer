@@ -3,6 +3,7 @@
 A Python command-line tool for building StageTraxx4 backup (`.st4b`) files. It supports two import modes:
 
 - **Stem import** — imports WAV stem files, auto-detects metadata from iTunes and lyrics from Genius, detects BPM from click tracks, skips silent stems, and optionally converts WAV to MP3.
+- **Stem refresh** — re-processes and replaces audio files in an existing backup without touching any metadata. Useful for refreshing stems after editing them externally.
 - **CSV bulk import** — imports a Spotify-export CSV to create song entries (no audio tracks) enriched with lyrics from Genius, using BPM and duration from the CSV.
 
 ## What It Does
@@ -35,6 +36,18 @@ A Python command-line tool for building StageTraxx4 backup (`.st4b`) files. It s
    - Enables the **StageTraxx 4 metronome** (`metronomeMode: 2`, `metronomeType: 1`) so that playing the song produces an audible click at the detected BPM — useful since CSV-imported songs have no audio tracks of their own.
 4. **Skips duplicates** automatically (non-interactive) by comparing normalized titles against existing songs.
 5. **Writes a new `.st4b` file** with the song entries merged into the existing backup.
+
+### Stem Refresh (`--refresh-stems`)
+
+1. **Reads an existing `.st4b` backup**.
+2. **Scans a directory of WAV stems** using the same filename format as `--stems`.
+3. **Matches each song** to an existing song in the backup by normalized title.
+4. **Matches each stem** to an existing track by stem name (e.g., `Click`, `Drums`, `Vocals_Lead`).
+5. **Converts WAV to MP3** (unless `--no-convert`) and **replaces the audio file** at the track's existing path in the archive.
+6. **Copies `backup_data.json` unchanged** — no metadata, timestamps, lyrics, or track entries are modified.
+7. **Writes a new `.st4b` file** with a timestamp suffix (e.g., `MyBackup_20260330_153045.st4b`) instead of the usual `_imported` suffix.
+
+Stems that don't match any existing song or track are warned and skipped.
 
 ## Stem Filename Format
 
@@ -121,12 +134,13 @@ python st4_import.py <input.st4b> [options]
 |---|---|
 | `--stems <dir>` | Path to the stems directory. Required for stem import. |
 | `--csv <file>` | Path to a Spotify-export CSV for bulk song import. |
-| `-o, --output <file>` | Output `.st4b` file path. Defaults to `<input>_imported.st4b`. |
+| `--refresh-stems <dir>` | Re-process stems and replace audio files without touching metadata. |
+| `-o, --output <file>` | Output `.st4b` file path. Defaults to `<input>_imported.st4b` (or `<input>_<timestamp>.st4b` with `--refresh-stems`). |
 | `--dry-run` | Preview what would be imported without writing any files. (Stems mode only.) |
-| `--no-convert` | Keep original WAV files instead of converting to MP3. (Stems mode only.) |
+| `--no-convert` | Keep original WAV files instead of converting to MP3. |
 | `--no-align` | Skip forced alignment of lyrics to lead vocal. (Stems mode only.) |
 
-At least one of `--stems` or `--csv` must be provided. Both can be combined in a single run to import stems and CSV songs into the same output file.
+At least one of `--stems`, `--csv`, or `--refresh-stems` must be provided.
 
 ### Generating a Spotify CSV
 
@@ -168,4 +182,10 @@ Keep WAV files without converting to MP3:
 
 ```bash
 python st4_import.py MyBackup.st4b --stems ./Stems --no-convert
+```
+
+Refresh stems after editing them (replaces audio only, metadata unchanged):
+
+```bash
+python st4_import.py MyBackup.st4b --refresh-stems ./Stems
 ```
