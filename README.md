@@ -139,6 +139,7 @@ python st4_import.py <input.st4b> [options]
 | `--dry-run` | Preview what would be imported without writing any files. (Stems mode only.) |
 | `--no-convert` | Keep original WAV files instead of converting to MP3. |
 | `--no-align` | Skip forced alignment of lyrics to lead vocal. (Stems mode only.) |
+| `--normalize-stems` | Normalize stem loudness to -16 LUFS before conversion using ffmpeg's `loudnorm` filter. Ensures consistent volume across all stems (e.g., click, bass, vocals). Requires ffmpeg. |
 
 At least one of `--stems`, `--csv`, or `--refresh-stems` must be provided.
 
@@ -182,6 +183,12 @@ Keep WAV files without converting to MP3:
 
 ```bash
 python st4_import.py MyBackup.st4b --stems ./Stems --no-convert
+```
+
+Normalize stem loudness to -16 LUFS during import:
+
+```bash
+python st4_import.py MyBackup.st4b --stems ./Stems --normalize-stems
 ```
 
 Refresh stems after editing them (replaces audio only, metadata unchanged):

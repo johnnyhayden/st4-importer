@@ -172,6 +172,26 @@ def align_lyrics_to_audio(lyrics_text, audio_wav_path):
         return None
 
 
+def normalize_audio(wav_path, target_i="-16", target_tp="-1.5", target_lra="11"):
+    """Normalize loudness of an audio file using ffmpeg's loudnorm filter.
+
+    Returns path to a temp normalized WAV file.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(wav_path),
+            "-af", f"loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}",
+            tmp.name,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+    return tmp.name
+
+
 def convert_wav_to_mp3(wav_path, bitrate="192k"):
     """Convert a WAV file to MP3 using ffmpeg. Returns path to a temp MP3 file."""
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
@@ -806,10 +826,18 @@ def main():
         help="Skip forced alignment of lyrics to lead vocal",
     )
     parser.add_argument(
+        "--normalize-stems", action="store_true",
+        help="Normalize stem loudness to -16 LUFS using ffmpeg's loudnorm filter",
+    )
+    parser.add_argument(
         "--refresh-stems", type=Path, default=None,
         help="Re-process stems and replace audio files without touching metadata",
     )
     args = parser.parse_args()
+
+    if args.normalize_stems and not ffmpeg_available():
+        print("Error: --normalize-stems requires ffmpeg on PATH")
+        sys.exit(1)
 
     if not args.csv and not args.stems and not args.refresh_stems:
         print("Error: provide --stems <dir>, --csv <file>, --refresh-stems <dir>, or a combination.")
@@ -1048,16 +1076,23 @@ def main():
 
                 bus = STEM_BUS_MAP.get(stem_name, DEFAULT_BUS)
 
+                # Normalize loudness if requested
+                src_path = path
+                if args.normalize_stems:
+                    norm_path = normalize_audio(str(path))
+                    temp_mp3_files.append(norm_path)
+                    src_path = Path(norm_path)
+
                 # Convert WAV→MP3 if enabled
                 if do_convert:
                     mp3_name = path.stem + ".mp3"
                     zip_file_path = f"{dir_name}/{mp3_name}"
-                    mp3_path = convert_wav_to_mp3(str(path))
+                    mp3_path = convert_wav_to_mp3(str(src_path))
                     temp_mp3_files.append(mp3_path)
                     local_file = Path(mp3_path)
                 else:
                     zip_file_path = f"{dir_name}/{path.name}"
-                    local_file = path
+                    local_file = src_path
 
                 track = make_track(
                     track_id=track_id,
@@ -1071,7 +1106,8 @@ def main():
                 song_tracks.append(track)
                 song_wavs.append((zip_file_path, local_file))
                 fmt = "mp3" if do_convert else "wav"
-                print(f"  Track {track_number}: {stem_name} → bus {bus + 1} ({dur:.1f}s) [{fmt}]")
+                norm_tag = " normalized" if args.normalize_stems else ""
+                print(f"  Track {track_number}: {stem_name} → bus {bus + 1} ({dur:.1f}s) [{fmt}{norm_tag}]")
 
             if not song_tracks:
                 print(f"  No non-silent tracks — skipping song")
@@ -1142,16 +1178,23 @@ def main():
 
                 existing_zip_path = track_by_stem[stem_name]
 
+                src_path = path
+                if args.normalize_stems:
+                    norm_path = normalize_audio(str(path))
+                    temp_mp3_files.append(norm_path)
+                    src_path = Path(norm_path)
+
                 if do_convert:
-                    mp3_path = convert_wav_to_mp3(str(path))
+                    mp3_path = convert_wav_to_mp3(str(src_path))
                     temp_mp3_files.append(mp3_path)
                     local_file = Path(mp3_path)
                 else:
-                    local_file = path
+                    local_file = src_path
 
                 refresh_files[existing_zip_path] = local_file
                 fmt = "mp3" if do_convert else "wav"
-                print(f"    {stem_name} → {existing_zip_path} [{fmt}]")
+                norm_tag = " normalized" if args.normalize_stems else ""
+                print(f"    {stem_name} → {existing_zip_path} [{fmt}{norm_tag}]")
                 refreshed_count += 1
 
         print(f"\n  {refreshed_count} stem(s) matched for refresh")
