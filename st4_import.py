@@ -172,17 +172,40 @@ def align_lyrics_to_audio(lyrics_text, audio_wav_path):
         return None
 
 
-def normalize_audio(wav_path, target_i="-16", target_tp="-1.5", target_lra="11"):
-    """Normalize loudness of an audio file using ffmpeg's loudnorm filter.
+def normalize_audio(wav_path, target_peak_db=-6.0):
+    """Peak-normalize an audio file so its loudest sample hits target_peak_db.
 
-    Returns path to a temp normalized WAV file.
+    Uses ffmpeg's volumedetect to measure the current peak, then applies
+    the exact gain needed. Returns path to a temp normalized WAV file.
     """
+    # Measure current peak level
+    result = subprocess.run(
+        [
+            "ffmpeg", "-i", str(wav_path),
+            "-af", "volumedetect",
+            "-f", "null", "-",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    current_peak = None
+    for line in result.stderr.splitlines():
+        if "max_volume" in line:
+            # e.g. "[Parsed_volumedetect...] max_volume: -12.3 dB"
+            current_peak = float(line.split("max_volume:")[1].strip().replace(" dB", ""))
+            break
+    if current_peak is None:
+        raise RuntimeError(f"Could not detect peak volume for {wav_path}")
+
+    gain = target_peak_db - current_peak
+
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", str(wav_path),
-            "-af", f"loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}",
+            "-af", f"volume={gain}dB",
             tmp.name,
         ],
         stdout=subprocess.DEVNULL,
@@ -827,7 +850,7 @@ def main():
     )
     parser.add_argument(
         "--normalize-stems", action="store_true",
-        help="Normalize stem loudness to -16 LUFS using ffmpeg's loudnorm filter",
+        help="Peak-normalize stem loudness to -6 dBFS using ffmpeg",
     )
     parser.add_argument(
         "--refresh-stems", type=Path, default=None,
@@ -1163,9 +1186,13 @@ def main():
             # Build map: stem_name -> track filePath
             track_by_stem = {}
             for t in song_tracks:
-                # filePath is like "Dreams__a1b2c3/Click.mp3"
-                base = t["filePath"].rsplit("/", 1)[-1]  # "Click.mp3"
-                stem_base = base.rsplit(".", 1)[0]  # "Click"
+                # filePath is like "American Girl__79df7f/American Girl_Tom Petty_01_Click.mp3"
+                base = t["filePath"].rsplit("/", 1)[-1]  # "American Girl_Tom Petty_01_Click.mp3"
+                parsed = parse_stem_filename(base)
+                if parsed:
+                    stem_base = parsed[3]  # stem_name, e.g. "Click"
+                else:
+                    stem_base = base.rsplit(".", 1)[0]
                 track_by_stem[stem_base] = t["filePath"]
 
             print(f"  Refreshing: \"{matched_song['title']}\"")
